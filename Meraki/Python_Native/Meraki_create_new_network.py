@@ -184,65 +184,87 @@ def do_action(func, *args, **kwargs):
     return func(*args, **kwargs)
 
 # =====================
-# Serial validation
+# Serial validation (provided)
 # =====================
+
 def prompt_and_validate_serials(org_id: str) -> List[str]:
+    """
+    Collect device serials from the user.
+    - Accepts EITHER a single comma-separated line OR multiple lines (one per line).
+    - Finish multi-line entry by pressing Enter on a blank line.
+    - If nothing is entered, warn and allow up to 4 attempts before exiting gracefully.
+    - Validates format (XXXX-XXXX-XXXX), checks inventory, and claims to org if 404.
+    - Deduplicates while preserving order.
+    """
+    MAX_ENTRY_ATTEMPTS = 4
     MAX_SERIAL_ATTEMPTS = 4
     serial_pattern = re.compile(r"[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}")
 
-    while True:
-        count_raw = input("How many devices/serials will you add to this org? (Enter to skip): ").strip()
-        if not count_raw:
-            return []
-        try:
-            intended_count = int(count_raw)
-            if intended_count <= 0:
-                print("ℹ️  Count must be a positive integer.")
+    attempt = 0
+    while attempt < MAX_ENTRY_ATTEMPTS:
+        print(
+            "\nEnter device serials:\n"
+            " • Paste a single comma-separated line (e.g. XXXX-XXXX-XXXX,YYYY-YYYY-YYYY)\n"
+            " • OR type one serial per line; press Enter on a blank line to finish."
+        )
+
+        # Gather input (supports single-line or multi-line)
+        entered_lines: List[str] = []
+        while True:
+            line = input("Serial(s): ").strip().upper()
+            if line == "":
+                # blank line ends multi-line entry
+                break
+            entered_lines.append(line)
+
+            # If user clearly pasted a big comma-separated line, we can stop immediately
+            if "," in line:
+                break
+
+        # Parse into candidate serials
+        candidates: List[str] = []
+        for ln in entered_lines:
+            parts = [p.strip() for p in ln.split(",") if p.strip()]
+            candidates.extend(parts)
+
+        # If nothing entered
+        if not candidates:
+            attempt += 1
+            remaining = MAX_ENTRY_ATTEMPTS - attempt
+            if remaining > 0:
+                print(f"❌ No serial number entered. ({remaining} attempt(s) left)")
                 continue
-            break
-        except ValueError:
-            print("ℹ️  Please enter a whole number (e.g., 3).")
+            else:
+                print("No serial numbers provided after multiple attempts. Exiting gracefully.")
+                raise SystemExit(1)
 
-    while True:
-        raw_line = input("Enter serial numbers (comma-separated, e.g. XXXX-XXXX-XXXX,YYYY-YYYY-YYYY): ").strip().upper()
-        if not raw_line:
-            print("ℹ️  No serials provided. Try again.")
-            continue
-
-        seen = set()
+        # Deduplicate while preserving order
+        seen: Set[str] = set()
         serial_list: List[str] = []
-        for part in raw_line.split(","):
-            s = part.strip()
-            if not s:
-                continue
+        for s in candidates:
             if s in seen:
                 print(f"ℹ️  Duplicate serial '{s}' removed from input.")
                 continue
             seen.add(s)
             serial_list.append(s)
 
-        entered_count = len(serial_list)
-        if entered_count != intended_count:
-            print(f"⚠️  You said {intended_count} device(s) but entered {entered_count}.")
-            choice = input("Proceed anyway? (yes to proceed / no to re-enter): ").strip().lower()
-            if choice not in {"y", "yes"}:
-                continue
-
+        # Validate each serial and ensure present in org inventory (claim if 404)
         collected: List[str] = []
         for idx, original_serial in enumerate(serial_list, start=1):
-            attempts = 0
+            attempts_for_this = 0
             serial = original_serial
-            while attempts < MAX_SERIAL_ATTEMPTS:
+            while attempts_for_this < MAX_SERIAL_ATTEMPTS:
                 if not serial_pattern.fullmatch(serial or ""):
-                    attempts += 1
-                    if attempts >= MAX_SERIAL_ATTEMPTS:
+                    attempts_for_this += 1
+                    if attempts_for_this >= MAX_SERIAL_ATTEMPTS:
                         print(f"❌ Maximum attempts reached for serial #{idx} ({original_serial}). Skipping.")
                         break
                     serial = input(
-                        f"Serial #{idx} '{serial}' is invalid. Re-enter (attempt {attempts+1}/{MAX_SERIAL_ATTEMPTS}): "
+                        f"Serial #{idx} '{serial}' is invalid. Re-enter (attempt {attempts_for_this+1}/{MAX_SERIAL_ATTEMPTS}): "
                     ).strip().upper()
                     continue
 
+                # Inventory check
                 try:
                     meraki_get(f"/organizations/{org_id}/inventoryDevices/{serial}")
                     print(f"✅ {serial} found in org inventory.")
@@ -250,6 +272,7 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
                     break
                 except MerakiAPIError as e:
                     if getattr(e, "status_code", None) == 404:
+                        # Claim into org
                         try:
                             do_action(meraki_post, f"/organizations/{org_id}/claim", data={"serials": [serial]})
                             print(f"✅ Serial '{serial}' successfully claimed into org inventory.")
@@ -257,13 +280,13 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
                             collected.append(serial)
                             break
                         except Exception as claim_ex:
-                            attempts += 1
+                            attempts_for_this += 1
                             print(f"❌ Error claiming '{serial}' into org inventory: {claim_ex}")
-                            if attempts >= MAX_SERIAL_ATTEMPTS:
+                            if attempts_for_this >= MAX_SERIAL_ATTEMPTS:
                                 print(f"❌ Maximum attempts reached for serial #{idx}. Skipping.")
                                 break
                             serial = input(
-                                f"Re-enter serial #{idx} (attempt {attempts+1}/{MAX_SERIAL_ATTEMPTS}): "
+                                f"Re-enter serial #{idx} (attempt {attempts_for_this+1}/{MAX_SERIAL_ATTEMPTS}): "
                             ).strip().upper()
                             continue
                     else:
@@ -273,16 +296,17 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
                     print(f"API Error for serial '{serial}': {e}")
                     break
 
-        if len(collected) != intended_count:
-            print(f"⚠️  Intended: {intended_count}, Entered: {entered_count}, Validated: {len(collected)}.")
-            choice = input("Proceed with validated devices anyway? (yes to proceed / no to re-enter all): ").strip().lower()
-            if choice in {"y", "yes"}:
-                return collected
-            else:
-                print("Okay, let's re-enter the serial list.")
-                continue
+        if collected:
+            return collected
 
-        return collected
+        # If we got here, user entered something but none validated/claimed
+        attempt += 1
+        remaining = MAX_ENTRY_ATTEMPTS - attempt
+        if remaining > 0:
+            print(f"⚠️  No valid serials collected. ({remaining} attempt(s) left))")
+        else:
+            print("No valid serials collected after multiple attempts. Exiting gracefully.")
+            raise SystemExit(1)
 
 # =====================
 # Network name + address
@@ -327,18 +351,26 @@ def list_organizations() -> List[Dict[str, Any]]:
 def choose_org() -> Tuple[str, str]:
     orgs = list_organizations()
     if not orgs:
-        raise RuntimeError("No organizations visible to this API key.")
+        print("⚠️  No organizations visible to this API key.")
+        raise SystemExit(1)
+
+    print("\nAvailable organizations:")
     for i, o in enumerate(orgs, 1):
         print(f"  {i:>2}. {o['name']} ({o['id']})")
+
     while True:
-        pick = input("Pick an organization by number: ").strip()
+        pick = input("Pick an organization by number (press Enter to cancel): ").strip().lower()
+        if pick in {"", "q", "quit", "cancel"}:
+            print("No Organisation selected -----------  Please retry when Org is known *******")
+            raise SystemExit(1)
         try:
             idx = int(pick)
             if 1 <= idx <= len(orgs):
                 return orgs[idx-1]["id"], orgs[idx-1]["name"]
         except ValueError:
             pass
-        print("Please enter a valid number.")
+        print("Please enter a valid number, or press Enter to cancel.")
+
 
 def list_templates(org_id: str) -> List[Dict[str, Any]]:
     return meraki_get(f"/organizations/{org_id}/configTemplates")
@@ -424,7 +456,7 @@ def get_network_devices_partitioned(network_id: str) -> Tuple[List[Dict[str, Any
     return mx_list, mr_list, ms_list
 
 # =====================
-# Selection logic (provided)
+# Selection logic
 # =====================
 def select_primary_mx(org_id: str, serials: List[str]) -> Optional[str]:
     """
@@ -535,7 +567,6 @@ def choose_template_for_mx(org_id: str, mx_models: Set[str]) -> Optional[Dict[st
 
     filtered = []
     if mx_models:
-        # Case-insensitive name match; enforce hyphen before model per requirement.
         wanted_suffixes = {f"nolegacy-{m.lower()}" for m in mx_models}
         for t in templates:
             name = (t.get("name") or "")
@@ -628,7 +659,7 @@ def choose_switch_profile_for_template_filtered(org_id: str, template_id: Option
     return None
 
 # =====================
-# Device naming (MX/MR/MS/MG) — applies site address and optional switch profile
+# Device naming (MX/MR/MS/MG)
 # =====================
 def name_and_configure_claimed_devices(
     org_id: str,
@@ -642,11 +673,11 @@ def name_and_configure_claimed_devices(
     ms_order: Optional[List[str]] = None,
 ):
     """
-    Renames and configures newly-claimed devices using optional ordering.
-    - MX -> <prefix>-mx-XX (primary first if provided)
-    - MR/CW916 -> <prefix>-ap-XX (optional order)
-    - MS -> <prefix>-ms-XX (optional order, apply profile only to compatible models)
-    - MG -> <prefix>-mg-XX
+    Renames and configures devices.
+    - MX -> <cc-epos>-mx-XX (primary first if provided)
+    - MR/CW916 -> <cc-epos>-ap-XX
+    - MS -> <cc-epos>-ms-XX (apply profile to compatible models)
+    - MG -> <cc-epos>-mg-XX
     Also sets 'address' for each device to 'site_address'.
     """
     prefix = '-'.join(network_name.split('-')[:2]).lower()
@@ -803,6 +834,55 @@ def create_switch_stack_if_possible(network_id: str, org_id: str, network_name: 
         misc=",".join(stack_serials),
     )
     print(f"✅ Switch stack created: {stack_name} ({len(stack_serials)} switches)")
+
+# =====================
+# Warm spare enforcement (swap if needed)
+# =====================
+def ensure_warm_spare_primary(network_id: str, primary_mx_serial: Optional[str]) -> None:
+    """
+    If warm spare is enabled and the selected PRIMARY MX isn't the current primary,
+    call the swap endpoint to make it primary.
+    """
+    if not primary_mx_serial:
+        return
+    try:
+        ws = meraki_get(f"/networks/{network_id}/appliance/warmSpare") or {}
+    except MerakiAPIError as e:
+        logging.warning(f"Warm spare lookup failed: {e.text}")
+        return
+    except Exception as e:
+        logging.warning(f"Warm spare lookup exception: {e}")
+        return
+
+    enabled = ws.get("enabled")
+    curr_primary = ws.get("primarySerial")
+    curr_spare = ws.get("spareSerial")
+
+    if not enabled:
+        logging.info("Warm spare not enabled; nothing to swap.")
+        return
+
+    if curr_primary == primary_mx_serial:
+        logging.info("Warm spare primary already correct.")
+        return
+
+    if primary_mx_serial not in {curr_primary, curr_spare}:
+        print(f"ℹ️  Selected PRIMARY MX {primary_mx_serial} is not one of the warm spare pair "
+              f"(primary={curr_primary}, spare={curr_spare}). Skipping swap.")
+        return
+
+    try:
+        do_action(meraki_post, f"/networks/{network_id}/appliance/warmSpare/swap")
+        log_change(
+            'warm_spare_swapped',
+            f"Swapped warm spare to make {primary_mx_serial} primary",
+            network_id=network_id,
+            device_serial=primary_mx_serial
+        )
+        print("✅ Warm spare roles swapped so the selected MX is primary.")
+    except Exception as e:
+        logging.exception(f"Failed to swap warm spare: {e}")
+        print(f"❌ Failed to swap warm spare: {e}")
 
 # =====================
 # Org-wide subnet index & /23 planning with collision checks
@@ -1074,53 +1154,6 @@ def handle_vlan_plan_prompt(org_id: str, org_name: str, network_id: str):
         org_index=get_org_subnets_index(org_id),
     )
 
-def ensure_warm_spare_primary(network_id: str, primary_mx_serial: Optional[str]) -> None:
-    """
-    If warm spare is enabled and the selected PRIMARY MX isn't the current primary,
-    call the swap endpoint to make it primary.
-    """
-    if not primary_mx_serial:
-        return
-    try:
-        ws = meraki_get(f"/networks/{network_id}/appliance/warmSpare") or {}
-    except MerakiAPIError as e:
-        logging.warning(f"Warm spare lookup failed: {e.text}")
-        return
-    except Exception as e:
-        logging.warning(f"Warm spare lookup exception: {e}")
-        return
-
-    enabled = ws.get("enabled")
-    curr_primary = ws.get("primarySerial")
-    curr_spare = ws.get("spareSerial")
-
-    if not enabled:
-        logging.info("Warm spare not enabled; nothing to swap.")
-        return
-
-    if curr_primary == primary_mx_serial:
-        logging.info("Warm spare primary already correct.")
-        return
-
-    if primary_mx_serial not in {curr_primary, curr_spare}:
-        print(f"ℹ️  Selected PRIMARY MX {primary_mx_serial} is not one of the warm spare pair "
-              f"(primary={curr_primary}, spare={curr_spare}). Skipping swap.")
-        return
-
-    try:
-        do_action(meraki_post, f"/networks/{network_id}/appliance/warmSpare/swap")
-        log_change(
-            'warm_spare_swapped',
-            f"Swapped warm spare to make {primary_mx_serial} primary",
-            network_id=network_id,
-            device_serial=primary_mx_serial
-        )
-        print("✅ Warm spare roles swapped so the selected MX is primary.")
-    except Exception as e:
-        logging.exception(f"Failed to swap warm spare: {e}")
-        print(f"❌ Failed to swap warm spare: {e}")
-
-
 # =====================
 # Main
 # =====================
@@ -1179,40 +1212,39 @@ def main():
     mr_order = select_device_order(org_id, serials, 'MR') if serials else []
     ms_order = select_device_order(org_id, serials, 'MS') if serials else []
 
-  # Claim devices (order doesn't matter; warm spare swap will enforce PRIMARY)
+    # Claim devices (order doesn't matter; warm spare swap will enforce PRIMARY)
     if serials:
         do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": serials})
         for s in serials:
             log_change("device_claimed_network", "Claimed device into network", device_serial=s, network_id=network_id)
 
-    # Filtered switch profile selection (AFTER claim)
-    selected_switch_profile: Optional[Tuple[str, Set[str], str]] = None
-    if template_id:
-        ms_models = _claimed_ms_models(org_id, serials)
-        selected_switch_profile = choose_switch_profile_for_template_filtered(org_id, template_id, ms_models)
+        # Filtered switch profile selection (AFTER claim)
+        selected_switch_profile: Optional[Tuple[str, Set[str], str]] = None
+        if template_id:
+            ms_models = _claimed_ms_models(org_id, serials)
+            selected_switch_profile = choose_switch_profile_for_template_filtered(org_id, template_id, ms_models)
 
-    # Name and configure devices (incl. addresses + optional MS profile for compatible models)
-    name_and_configure_claimed_devices(
-        org_id=org_id,
-        network_id=network_id,
-        network_name=network_name,
-        site_address=site_address,
-        serials=serials,
-        ms_switch_profile=selected_switch_profile,
-        primary_mx_serial=primary_mx_serial,  # still used for naming (mx-01)
-        mr_order=mr_order,
-        ms_order=ms_order,
-    )
+        # Name and configure devices (incl. addresses + optional MS profile for compatible models)
+        name_and_configure_claimed_devices(
+            org_id=org_id,
+            network_id=network_id,
+            network_name=network_name,
+            site_address=site_address,
+            serials=serials,
+            ms_switch_profile=selected_switch_profile,
+            primary_mx_serial=primary_mx_serial,  # used for mx-01 naming
+            mr_order=mr_order,
+            ms_order=ms_order,
+        )
 
-    # Create a switch stack if possible
-    create_switch_stack_if_possible(network_id, org_id, network_name, serials)
+        # Create a switch stack if possible
+        create_switch_stack_if_possible(network_id, org_id, network_name, serials)
 
-    # Ensure warm spare primary matches selected MX01
-    ensure_warm_spare_primary(network_id, primary_mx_serial)
+        # Ensure warm spare primary matches selected MX01
+        ensure_warm_spare_primary(network_id, primary_mx_serial)
 
-    # Cleanup: always remove the 'recently-added' tag if present
-    remove_recently_added_tag(network_id)
-  
+        # Cleanup: always remove the 'recently-added' tag if present
+        remove_recently_added_tag(network_id)
 
     print("\n✅ Workflow complete.")
     log_change("workflow_complete", "Network creation workflow finished", org_id=org_id, org_name=org_name, network_id=network_id, network_name=network_name)
