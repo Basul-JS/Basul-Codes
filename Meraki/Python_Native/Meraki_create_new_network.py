@@ -192,7 +192,8 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
     Collect device serials from the user.
     - Accepts EITHER a single comma-separated line OR multiple lines (one per line).
     - Finish multi-line entry by pressing Enter on a blank line.
-    - If nothing is entered, warn and allow up to 4 attempts before exiting gracefully.
+    - If nothing is entered, warn and allow up to 4 attempts; then ask whether to continue WITHOUT serials.
+      If yes: return []; if no: exit gracefully.
     - Validates format (XXXX-XXXX-XXXX), checks inventory, and claims to org if 404.
     - Deduplicates while preserving order.
     """
@@ -216,8 +217,7 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
                 # blank line ends multi-line entry
                 break
             entered_lines.append(line)
-
-            # If user clearly pasted a big comma-separated line, we can stop immediately
+            # If user pasted a comma-separated list, stop immediately to parse it
             if "," in line:
                 break
 
@@ -227,16 +227,23 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
             parts = [p.strip() for p in ln.split(",") if p.strip()]
             candidates.extend(parts)
 
-        # If nothing entered
+        # If nothing entered this attempt
         if not candidates:
             attempt += 1
             remaining = MAX_ENTRY_ATTEMPTS - attempt
             if remaining > 0:
                 print(f"❌ No serial number entered. ({remaining} attempt(s) left)")
                 continue
-            else:
-                print("No serial numbers provided after multiple attempts. Exiting gracefully.")
-                raise SystemExit(1)
+            # Ask whether to continue without serials
+            choice = input(
+                "No serial numbers provided after multiple attempts.\n"
+                "Do you want to continue creating the network WITHOUT serials? (yes/no): "
+            ).strip().lower()
+            if choice in {"y", "yes"}:
+                print("Proceeding without serials.")
+                return []
+            print("Exiting — please retry when serials are available.")
+            raise SystemExit(1)
 
         # Deduplicate while preserving order
         seen: Set[str] = set()
@@ -299,11 +306,11 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
         if collected:
             return collected
 
-        # If we got here, user entered something but none validated/claimed
+        # We got input but none validated/claimed this round
         attempt += 1
         remaining = MAX_ENTRY_ATTEMPTS - attempt
         if remaining > 0:
-            print(f"⚠️  No valid serials collected. ({remaining} attempt(s) left))")
+            print(f"⚠️  No valid serials collected. ({remaining} attempt(s) left)")
         else:
             print("No valid serials collected after multiple attempts. Exiting gracefully.")
             raise SystemExit(1)
