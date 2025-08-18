@@ -192,16 +192,19 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
     Collect device serials from the user.
     - Accepts EITHER a single comma-separated line OR multiple lines (one per line).
     - Finish multi-line entry by pressing Enter on a blank line.
-    - If nothing is entered, warn and allow up to 4 attempts; then ask whether to continue WITHOUT serials.
-      If yes: return []; if no: exit gracefully.
+    - If nothing is entered:
+        • After 2 blank attempts: ask whether to continue WITHOUT serials (return []).
+        • Up to 4 total attempts; if still nothing and user declines, exit gracefully.
     - Validates format (XXXX-XXXX-XXXX), checks inventory, and claims to org if 404.
     - Deduplicates while preserving order.
     """
     MAX_ENTRY_ATTEMPTS = 4
+    BLANK_PROMPT_THRESHOLD = 2
     MAX_SERIAL_ATTEMPTS = 4
     serial_pattern = re.compile(r"[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}")
 
     attempt = 0
+    blank_attempts = 0
     while attempt < MAX_ENTRY_ATTEMPTS:
         print(
             "\nEnter device serials:\n"
@@ -230,20 +233,25 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
         # If nothing entered this attempt
         if not candidates:
             attempt += 1
+            blank_attempts += 1
             remaining = MAX_ENTRY_ATTEMPTS - attempt
+
+            # After 2 blank tries, offer to continue without serials
+            if blank_attempts >= BLANK_PROMPT_THRESHOLD:
+                choice = input(
+                    "No serial numbers entered.\n"
+                    "Do you want to continue creating the network WITHOUT serials? (yes/no): "
+                ).strip().lower()
+                if choice in {"y", "yes"}:
+                    print("Proceeding without serials.")
+                    return []
+
             if remaining > 0:
                 print(f"❌ No serial number entered. ({remaining} attempt(s) left)")
                 continue
-            # Ask whether to continue without serials
-            choice = input(
-                "No serial numbers provided after multiple attempts.\n"
-                "Do you want to continue creating the network WITHOUT serials? (yes/no): "
-            ).strip().lower()
-            if choice in {"y", "yes"}:
-                print("Proceeding without serials.")
-                return []
-            print("Exiting — please retry when serials are available.")
-            raise SystemExit(1)
+            else:
+                print("No serial numbers provided after multiple attempts. Exiting gracefully.")
+                raise SystemExit(1)
 
         # Deduplicate while preserving order
         seen: Set[str] = set()
