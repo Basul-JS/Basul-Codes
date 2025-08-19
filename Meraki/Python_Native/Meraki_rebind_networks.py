@@ -35,7 +35,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-CSV_LOGFILE = f"meraki_changes_{timestamp}.csv"
+CSV_LOGFILE = f"meraki_techboost25_rebind_{timestamp}.csv"
 
 # =====================
 # Utility: CSV audit log
