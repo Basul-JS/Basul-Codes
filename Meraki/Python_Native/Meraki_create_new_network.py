@@ -1,6 +1,6 @@
 # Created by J A Said
-    # Create a new network in the specsavers organisation 
-    # Updated 20250818 - better logic around primary MX
+# Create a new network in the specsavers organisation
+# Updated 20250818 - better logic around primary MX
 
 import requests
 import logging
@@ -186,7 +186,6 @@ def do_action(func, *args, **kwargs):
 # =====================
 # Serial validation (provided)
 # =====================
-
 def prompt_and_validate_serials(org_id: str) -> List[str]:
     """
     Collect device serials from the user.
@@ -323,6 +322,9 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
             print("No valid serials collected after multiple attempts. Exiting gracefully.")
             raise SystemExit(1)
 
+    # Should not reach here; satisfies type checker
+    return []
+
 # =====================
 # Network name + address
 # =====================
@@ -385,7 +387,6 @@ def choose_org() -> Tuple[str, str]:
         except ValueError:
             pass
         print("Please enter a valid number, or press Enter to cancel.")
-
 
 def list_templates(org_id: str) -> List[Dict[str, Any]]:
     return meraki_get(f"/organizations/{org_id}/configTemplates")
@@ -906,12 +907,15 @@ def get_org_subnets_index(org_id: str) -> List[Tuple[ipaddress.IPv4Network, str,
     index: List[Tuple[ipaddress.IPv4Network, str, str]] = []
     nets = meraki_get(f"/organizations/{org_id}/networks", params={"perPage": 1000}) or []
     for n in nets:
-        nid = n.get("id"); nname = n.get("name", "")
+        nid = n.get("id")
+        nname = n.get("name", "")
         try:
             for cidr in get_network_ip_subnets(nid):
                 try:
-                    index.append((ipaddress.ip_network(cidr, strict=True), nname, nid))
+                    net_cidr = ipaddress.IPv4Network(cidr, strict=True)  # IPv4-only
+                    index.append((net_cidr, str(nname), str(nid)))
                 except Exception:
+                    # skip invalid/IPv6 entries
                     continue
         except Exception:
             continue
@@ -919,9 +923,9 @@ def get_org_subnets_index(org_id: str) -> List[Tuple[ipaddress.IPv4Network, str,
 
 def derive_site23_standard_subnets(site23: ipaddress.IPv4Network) -> Dict[int, ipaddress.IPv4Network]:
     o1, o2, o3, _ = [int(x) for x in str(site23.network_address).split(".")]
-    even24 = ipaddress.ip_network(f"{o1}.{o2}.{o3}.0/24", strict=True)
-    vlan50 = ipaddress.ip_network(f"{o1}.{o2}.{o3+1}.192/27", strict=True)
-    vlan10 = ipaddress.ip_network(f"{o1}.{o2}.{o3+1}.224/27", strict=True)
+    even24 = ipaddress.IPv4Network(f"{o1}.{o2}.{o3}.0/24", strict=True)
+    vlan50 = ipaddress.IPv4Network(f"{o1}.{o2}.{o3+1}.192/27", strict=True)
+    vlan10 = ipaddress.IPv4Network(f"{o1}.{o2}.{o3+1}.224/27", strict=True)
     return {40: even24, 50: vlan50, 10: vlan10}
 
 def find_overlaps_in_org(candidate: ipaddress.IPv4Network,
@@ -937,10 +941,7 @@ def prompt_site_supernet_23() -> ipaddress.IPv4Network:
     while True:
         raw = input("Site IPv4 /23 (e.g., 10.x.y.0/23 where y is even): ").strip()
         try:
-            net = ipaddress.ip_network(raw, strict=True)
-            if net.version != 4:
-                print("❌ Please enter an IPv4 network.")
-                continue
+            net = ipaddress.IPv4Network(raw, strict=True)  # IPv4-only
             if net.prefixlen != 23:
                 print("❌ Prefix must be /23.")
                 continue
@@ -1004,8 +1005,8 @@ def prompt_subnet_and_gateway_for_vlan(
         if raw_subnet == "":
             return None
         try:
-            subnet = ipaddress.ip_network(raw_subnet, strict=True)
-            if subnet.version != 4 or not subnet.subnet_of(site23):
+            subnet = ipaddress.IPv4Network(raw_subnet, strict=True)  # IPv4-only
+            if not subnet.subnet_of(site23):
                 print(f"❌ Subnet must be an IPv4 CIDR within {site23}.")
                 continue
             if any(subnet.overlaps(t) for t in taken):
@@ -1024,8 +1025,8 @@ def prompt_subnet_and_gateway_for_vlan(
 
         gw_raw = input(f"VLAN {vlan_id} gateway IP (must be inside {subnet}): ").strip()
         try:
-            gw_ip = ipaddress.ip_address(gw_raw)
-            if gw_ip.version != 4 or not _ip_is_usable_in(gw_ip, subnet):
+            gw_ip = ipaddress.IPv4Address(gw_raw)  # IPv4-only
+            if not _ip_is_usable_in(gw_ip, subnet):
                 print("❌ Gateway must be a usable host IP inside the subnet.")
                 continue
         except Exception:
@@ -1051,22 +1052,22 @@ def apply_site23_vlan_scheme(
     except Exception as e:
         logging.warning(f"Could not enable VLANs (template-controlled or not MX?): {e}")
     o1, o2, o3, _ = [int(x) for x in str(site23.network_address).split(".")]
-    even24 = ipaddress.ip_network(f"{o1}.{o2}.{o3}.0/24", strict=True)
+    even24 = ipaddress.IPv4Network(f"{o1}.{o2}.{o3}.0/24", strict=True)
     planned: Dict[int, Dict[str, str]] = {
         40: {"subnet": str(even24),
              "applianceIp": str(ipaddress.IPv4Address(int(even24.network_address) + vlan40_gw_last_octet)),
              "desc": "VLAN 40 (even /24)"},
-        50: {"subnet": str(ipaddress.ip_network(f"{o1}.{o2}.{o3+1}.192/27", strict=True)),
+        50: {"subnet": str(ipaddress.IPv4Network(f"{o1}.{o2}.{o3+1}.192/27", strict=True)),
              "applianceIp": f"{o1}.{o2}.{o3+1}.222",
              "desc": "VLAN 50 (odd .192/27)"},
-        10: {"subnet": str(ipaddress.ip_network(f"{o1}.{o2}.{o3+1}.224/27", strict=True)),
+        10: {"subnet": str(ipaddress.IPv4Network(f"{o1}.{o2}.{o3+1}.224/27", strict=True)),
              "applianceIp": f"{o1}.{o2}.{o3+1}.254",
              "desc": "VLAN 10 (odd .224/27)"},
     }
     taken_subnets: List[ipaddress.IPv4Network] = [
-        ipaddress.ip_network(planned[40]["subnet"], strict=True),
-        ipaddress.ip_network(planned[50]["subnet"], strict=True),
-        ipaddress.ip_network(planned[10]["subnet"], strict=True),
+        ipaddress.IPv4Network(planned[40]["subnet"], strict=True),
+        ipaddress.IPv4Network(planned[50]["subnet"], strict=True),
+        ipaddress.IPv4Network(planned[10]["subnet"], strict=True),
     ]
     try:
         vlans = meraki_get(f"/networks/{network_id}/appliance/vlans") or []
@@ -1130,11 +1131,11 @@ def handle_vlan_plan_prompt(org_id: str, org_name: str, network_id: str):
     org_index = get_org_subnets_index(org_id)
     if re.fullmatch(cidr_re, resp):
         try:
-            primed = ipaddress.ip_network(resp, strict=True)
+            primed = ipaddress.IPv4Network(resp, strict=True)  # IPv4-only
         except Exception:
             primed = None
         ok = False
-        if primed and primed.version == 4 and primed.prefixlen == 23 and int(str(primed.network_address).split(".")[0]) == 10 and int(str(primed.network_address).split(".")[2]) % 2 == 0:
+        if primed and primed.prefixlen == 23 and int(str(primed.network_address).split(".")[0]) == 10 and int(str(primed.network_address).split(".")[2]) % 2 == 0:
             plan = derive_site23_standard_subnets(primed)
             conflicts = []
             for vid, sn in plan.items():
@@ -1278,3 +1279,4 @@ if __name__ == "__main__":
         print(f"Unexpected error: {e}")
         log_change("error_unhandled", str(e))
         sys.exit(3)
+
