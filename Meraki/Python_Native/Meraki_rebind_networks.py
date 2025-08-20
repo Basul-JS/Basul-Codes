@@ -1,10 +1,10 @@
 # Created by J A Said
-    # Rebinds network to a New Template
-    # Template is auto selected based on the model of MX that is been added 
-        # Roll back functionality updated
-    #   20250818 - graceful exit if either org or network not selected
-    #   20250818 - updated logic to handle blank serials
-    #   20250818 - updated rollback function
+# Rebinds network to a New Template
+# Template is auto selected based on the model of MX that is been added 
+# Roll back functionality updated
+#   20250818 - graceful exit if either org or network not selected
+#   20250818 - updated logic to handle blank serials
+#   20250818 - updated rollback function
 
 import requests
 import logging
@@ -419,8 +419,8 @@ def classify_serials_for_binding(org_id: str, net_id: str, serials: List[str]):
             logging.error(f"Error checking inventory for {s}: {e}")
     return already, elsewhere, avail
 
-def _clear_and_remove_models(network_id: str, models: Tuple[str, ...]) -> bool:
-    # Uses global org_id (set in main)
+# ---------- Clear & remove by model (org-aware) ----------
+def _clear_and_remove_models(org_id: str, network_id: str, models: Tuple[str, ...]) -> bool:
     mx, ms, mr = fetch_devices(org_id, network_id)
     all_devs = mx + ms + mr
     to_remove = [d['serial'] for d in all_devs if d['model'] in models]
@@ -440,11 +440,11 @@ def _clear_and_remove_models(network_id: str, models: Tuple[str, ...]) -> bool:
         logging.exception("Error removing devices")
     return True
 
-def remove_existing_mx64_devices(network_id: str) -> bool:
-    return _clear_and_remove_models(network_id, ("MX64",))
+def remove_existing_mx64_devices(org_id: str, network_id: str) -> bool:
+    return _clear_and_remove_models(org_id, network_id, ("MX64",))
 
-def remove_existing_MR33_devices(network_id: str) -> bool:
-    return _clear_and_remove_models(network_id, ("MR33",))
+def remove_existing_MR33_devices(org_id: str, network_id: str) -> bool:
+    return _clear_and_remove_models(org_id, network_id, ("MR33",))
 
 # ---------- Prompt + claim into ORG (before selecting network) ----------
 def prompt_and_validate_serials(org_id: str) -> List[str]:
@@ -656,7 +656,7 @@ def claim_devices(org_id: str, network_id: str, prevalidated_serials: Optional[L
         return already
 
     try:
-        remove_existing_mx64_devices(network_id)
+        remove_existing_mx64_devices(org_id, network_id)
         do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": avail})
         for s in avail:
             log_change('device_claimed', f"Claimed device to network", device_serial=s)
@@ -1251,9 +1251,13 @@ def rollback_all_changes(
 
         try:
             do_action(meraki_put, f"/devices/{dev['serial']}", data=update_args)
-            log_change('rollback_device_update', f"Restored device config during rollback",
-                       device_serial=dev['serial'], device_name=dev.get('name', ''),
-                       misc=f"tags={dev.get('tags', [])}, address={dev.get('address', '')}")
+            log_change(
+                'rollback_device_update',
+                f"Restored device config during rollback",
+                device_serial=dev['serial'],
+                device_name=dev.get('name', ''),
+                misc=f"tags={dev.get('tags', [])}, address={dev.get('address', '')}"
+            )
         except Exception:
             logging.exception(f"Failed to update device {dev['serial']} during rollback")
             continue
@@ -1306,20 +1310,22 @@ def print_summary(step_status: Dict[str, StatusVal]) -> None:
 # =====================
 # Robust network selector
 # =====================
-def select_network_interactive(org_id: str) -> Tuple[Optional[str], Optional[str]]:
+def select_network_interactive(org_id: str) -> Tuple[str, str]:
     """Robust interactive network selector. Returns (network_id, network_name) or (None, None) if cancelled."""
     while True:
         partial = input("Enter partial network name to search (or press Enter to cancel): ").strip()
         if not partial:
-            return None, None
+            print("\n❌ No Network selected -----------\n   Please retry when Network is known *******")
+        sys.exit(1)
 
         networks = fetch_matching_networks(org_id, partial)
         if not networks:
             print("\n❌ No matching networks found -----------")
             retry = input("Search again? (y/N): ").strip().lower()
             if retry != 'y':
-                return None, None
-            continue
+                print("\n❌ No Network selected -----------\n   Please retry when Network is known *******")
+        sys.exit(1)
+        continue
 
         if len(networks) == 1:
             only = networks[0]
@@ -1340,26 +1346,21 @@ def select_network_interactive(org_id: str) -> Tuple[Optional[str], Optional[str
         while True:
             raw = input("Select the network by number (or press Enter to cancel): ").strip()
             if not raw:
-                return None, None
-            if raw.isdigit():
+                print("\n❌ No Network selected -----------\n   Please retry when Network is known *******")
+        sys.exit(1)
+        if raw.isdigit():
                 choice = int(raw)
                 if 1 <= choice <= len(networks):
                     chosen = networks[choice - 1]
                     print(f"Selected network #{choice}: {chosen['name']} (ID: {chosen['id']})")
                     return chosen['id'], chosen['name']
-            print("❌ Invalid selection. Please enter a valid number from the list.")
+        print("❌ Invalid selection. Please enter a valid number from the list.")
 
 # =====================
-# Main
+# Org selector
 # =====================
-if __name__ == '__main__':
-    log_change('workflow_start', 'Script started')
-
-    step_status: Dict[str, StatusVal] = {}
-
-    # -------- Select Org (graceful cancel/invalid) --------
+def select_org() -> str:
     orgs = meraki_get("/organizations")
-
     if not orgs:
         print("\n❌ No Organisations returned from API -----------")
         print("   Please retry when Org is known *******")
@@ -1384,7 +1385,18 @@ if __name__ == '__main__':
         print("   Please retry when Org is known *******")
         sys.exit(1)
 
-    org_id = orgs[org_idx - 1]['id']
+    return orgs[org_idx - 1]['id']
+
+# =====================
+# Main
+# =====================
+if __name__ == '__main__':
+    log_change('workflow_start', 'Script started')
+
+    step_status: Dict[str, StatusVal] = {}
+
+    # -------- Select Org (graceful cancel/invalid) --------
+    org_id = select_org()
 
     # -------- Prompt/validate serials now (org-level), then summarize --------
     prevalidated_serials = prompt_and_validate_serials(org_id)
@@ -1398,10 +1410,6 @@ if __name__ == '__main__':
 
     # -------- Select Network (robust) --------
     network_id, network_name = select_network_interactive(org_id)
-    if not network_id:
-        print("\n❌ No Network selected -----------")
-        print("   Please retry when Network is known *******")
-        sys.exit(1)
 
     net_info = meraki_get(f"/networks/{network_id}")
     old_template = net_info.get('configTemplateId')
@@ -1443,14 +1451,17 @@ if __name__ == '__main__':
         ms_order = select_device_order(org_id, claimed, 'MS')
 
         try:
+            tpl_profiles = []
             if old_template:
                 tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{old_template}/switch/profiles")
                 tpl_profile_map = {p['name']: p['switchProfileId'] for p in tpl_profiles}
             else:
                 tpl_profile_map = {}
+                tpl_profiles = []
         except Exception:
             logging.exception("Failed fetch template switch profiles")
             tpl_profile_map = {}
+            tpl_profiles = []
 
         try:
             name_and_configure_claimed_devices(
@@ -1473,7 +1484,7 @@ if __name__ == '__main__':
             step_status['configured'] = False
 
         try:
-            removed_mr33_ok = remove_existing_MR33_devices(network_id)
+            removed_mr33_ok = remove_existing_MR33_devices(org_id, network_id)
             step_status['mr33_removed'] = removed_mr33_ok
             if removed_mr33_ok:
                 log_change('mr33_removed', "Removed old MR33 after new AP claim", misc=f"claimed_serials={claimed}")
@@ -1500,16 +1511,16 @@ if __name__ == '__main__':
             log_change('rollback_start', 'User requested rollback')
             post_change_devices = meraki_get(f"/networks/{network_id}/devices")
             post_change_serials = {d['serial'] for d in post_change_devices}
-            claimed_serials = list(post_change_serials - pre_change_serials)
-            removed_serials = list(pre_change_serials - post_change_serials)
+            claimed_serials_rb = list(post_change_serials - pre_change_serials)
+            removed_serials_rb = list(pre_change_serials - post_change_serials)
             rollback_all_changes(
                 network_id,
                 pre_change_devices,
                 pre_change_vlans,
                 pre_change_template,
                 org_id,
-                claimed_serials=claimed_serials,
-                removed_serials=removed_serials,
+                claimed_serials=claimed_serials_rb,
+                removed_serials=removed_serials_rb,
                 ms_list=ms,
                 network_name=network_name,
             )
@@ -1547,7 +1558,7 @@ if __name__ == '__main__':
             org_id,
             network_id,
             old_template,
-            net_info['name'],
+            network_name,
             pre_change_devices=pre_change_devices,
             pre_change_vlans=pre_change_vlans,
             pre_change_template=pre_change_template,
@@ -1591,6 +1602,7 @@ if __name__ == '__main__':
     except Exception:
         logging.exception("Failed fetch template switch profiles")
         tpl_profile_map = {}
+        tpl_profiles = []
 
     _, postbind_ms_devices, _ = fetch_devices(org_id, network_id)
     for sw in postbind_ms_devices:
@@ -1603,9 +1615,13 @@ if __name__ == '__main__':
                 continue
         try:
             do_action(meraki_put, f"/devices/{sw['serial']}", data={"switchProfileId": new_profile_id})
-            log_change('switch_profile_assign', f"Assigned switchProfileId {new_profile_id} to {sw['serial']}",
-                       device_serial=sw['serial'], device_name=sw.get('name', ''),
-                       misc=f"profile_name={old_profile_name or ''}")
+            log_change(
+                'switch_profile_assign',
+                f"Assigned switchProfileId {new_profile_id} to {sw['serial']}",
+                device_serial=sw['serial'],
+                device_name=sw.get('name', ''),
+                misc=f"profile_name={old_profile_name or ''}"
+            )
             preserved = (sw.get('port_overrides') or {})
             if preserved:
                 apply_port_overrides(sw['serial'], preserved)
@@ -1639,14 +1655,14 @@ if __name__ == '__main__':
                 except Exception:
                     pass
             if any(m.startswith('MX67') or m.startswith('MX75') for m in mx_models):
-                remove_existing_mx64_devices(network_id)
+                remove_existing_mx64_devices(org_id, network_id)
                 log_change('mx_removed', "Removed old MX64 after new MX claim", misc=f"claimed_serials={claimed}")
             step_status['mx_removed'] = True
         except Exception:
             logging.exception("MX removal failed")
             step_status['mx_removed'] = False
         try:
-            mr33_ok = remove_existing_MR33_devices(network_id)
+            mr33_ok = remove_existing_MR33_devices(org_id, network_id)
             step_status['mr33_removed'] = mr33_ok
             if mr33_ok:
                 log_change('mr33_removed', "Removed old MR33 after new AP claim", misc=f"claimed_serials={claimed}")
