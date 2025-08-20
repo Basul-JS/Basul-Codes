@@ -1,3 +1,7 @@
+# Created by J A Said
+# Date: 2025-08-20
+# Description: This script removes unassigned devices from a Meraki organization.
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -73,7 +77,6 @@ def matches_model_prefix(model: str, tokens: List[str]) -> bool:
     mu = model.upper()
     for t in tokens:
         if "*" in t:
-            # Convert '*' to '.*' and anchor
             pattern = "^" + re.escape(t).replace(r"\*", ".*") + "$"
             if re.match(pattern, mu, re.IGNORECASE):
                 return True
@@ -312,7 +315,7 @@ if not filtered_devices:
 # ---------- Step 4: Export preview to CSV (optional) ----------
 export = input("Export these devices to CSV? (y/n): ").lower()
 if export == 'y':
-    filename = f"meraki_unassigned_inventory_{orgid}.csv"
+    filename = f"meraki_unassigned_inventory_{orgid_str}.csv"
     if filtered_devices:
         keys = sorted(set().union(*(d.keys() for d in filtered_devices)))
         with open(filename, "w", newline="") as f:
@@ -375,7 +378,7 @@ for batch in chunked([{"serial": s} for s in serials_all], 100):
     time.sleep(0.5)
 
 if removal_log:
-    removal_filename = f"meraki_removed_inventory_{orgid}.csv"
+    removal_filename = f"meraki_removed_inventory_{orgid_str}.csv"
     with open(removal_filename, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["serial", "mac", "model", "name", "removed_at"])
         writer.writeheader()
