@@ -23,7 +23,6 @@ import time
 from datetime import datetime, timedelta, UTC
 from getpass import getpass
 from typing import Any, Dict, Iterator, List, Optional, cast
-
 import logging
 import meraki
 
