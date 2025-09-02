@@ -2,6 +2,7 @@
 # Rebinds network to a New Template
 # Template is auto selected based on the model of MX that is been added 
     # Template selection logic 
+#   20250902 - updated rollback font to make it more prominent
     
 import requests
 import logging
@@ -1485,6 +1486,44 @@ def select_org() -> str:
 
     return orgs[org_idx - 1]['id']
 
+# ------------- Change Rollback Font -------------
+
+def prompt_rollback_big() -> str:
+    # Import locally so names are always bound for Pylance,
+    # and gracefully fall back if Rich/pyfiglet isn't installed.
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.text import Text
+        import pyfiglet
+    except Exception:
+        return prompt_rollback_basic()
+
+    console = Console()
+    banner = pyfiglet.figlet_format("ROLLBACK", font="slant")
+    console.print(f"[bold red]{banner}[/bold red]")
+    console.print(Panel.fit(
+        Text(
+            "Type 'yes' to rollback changes, 'no' to continue without rollback, or just press Enter to skip.\n"
+            "IMPORTANT: If you skip (press Enter), rollback will no longer be available.\n"
+            "Have you ensured the network is fully functional and all required checks have been carried out?",
+            style="bold white"
+        ),
+        title="⚠️  ROLLBACK OPTION",
+        title_align="left",
+        border_style="red"
+    ))
+    return input("> ").strip().lower()
+
+def prompt_rollback_basic() -> str:
+    print("\n" + "!"*78)
+    print("⚠️  R O L L B A C K   O P T I O N  ⚠️".center(78))
+    print("!"*78)
+    print("Type 'yes' to rollback changes, 'no' to continue without rollback, or just press Enter to skip.")
+    print("IMPORTANT: If you skip (Enter), rollback will no longer be available.")
+    print("Have you ensured the network is fully functional and all required checks have been carried out?")
+    return input("> ").strip().lower()
+
 # =====================
 # Main
 # =====================
@@ -1597,13 +1636,8 @@ if __name__ == '__main__':
         print_summary(step_status)
 
         # -------- Enhanced rollback prompt --------
-        rollback_choice = input(
-            "\n⚠️  Rollback option available.\n"
-            "Type 'yes' to rollback changes, 'no' to continue without rollback, or just press Enter to skip.\n"
-            "IMPORTANT: If you skip (press Enter), rollback will no longer be available.\n"
-            "Have you ensured the network is fully functional and all required checks have been carried out? (yes/no/Enter): "
-        ).strip().lower()
-
+        rollback_choice = prompt_rollback_big()
+        
         if rollback_choice in {'yes', 'y'}:
             print("\nRolling back all changes...")
             log_change('rollback_start', 'User requested rollback')
@@ -1798,13 +1832,8 @@ if __name__ == '__main__':
     print_summary(step_status)
 
     # -------- Enhanced rollback prompt --------
-    rollback_choice = input(
-        "\n⚠️  Rollback option available.\n"
-        "Type 'yes' to rollback changes, 'no' to continue without rollback, or just press Enter to skip.\n"
-        "IMPORTANT: If you skip (press Enter), rollback will no longer be available.\n"
-        "Have you ensured the network is fully functional and all required checks have been carried out? (yes/no/Enter): "
-    ).strip().lower()
-
+    rollback_choice = prompt_rollback_big()
+    
     if rollback_choice in {'yes', 'y'}:
         print("\nRolling back all changes...")
         log_change('rollback_start', 'User requested rollback')
