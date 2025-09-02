@@ -1262,6 +1262,23 @@ def get_profileid_to_name(org_id: str, template_id: Optional[str]) -> Dict[str, 
 
 # ------------- Excel snapshot export -------------
 
+def _slug_filename(s: str) -> str:
+    # keep letters, numbers, dot, underscore, hyphen; replace others with '-'
+    s = re.sub(r'[^A-Za-z0-9._-]+', '-', s).strip('-_')
+    return s[:80]  # keep it tidy
+
+def _network_tag_from_name(name: str) -> str:
+    # If your convention is "UK-0593-Whatever", return "UK-0593"
+    parts = name.split('-')
+    if len(parts) >= 2 and parts[1].isdigit():
+        return f"{parts[0]}-{parts[1]}"
+    return name
+
+def _network_number_from_name(name: str) -> str | None:
+    # Grab the first standalone number block (e.g., 0593)
+    m = re.search(r'\b(\d{2,8})\b', name)
+    return m.group(1) if m else None
+
 def export_network_snapshot_xlsx(
     org_id: str,
     network_id: str,
@@ -1273,6 +1290,7 @@ def export_network_snapshot_xlsx(
     mr_list: List[Dict[str, Any]],
     profileid_to_name: Optional[Dict[str, str]] = None,
     outfile: Optional[str] = None,
+    filename_mode: str = "name",  # NEW: "name" | "number"
 ) -> None:
     def _json(x: Any) -> str:
         try:
@@ -1280,7 +1298,16 @@ def export_network_snapshot_xlsx(
         except Exception:
             return str(x)
 
-    out_path: str = outfile or f"network_snapshot_{timestamp}.xlsx"
+    # --- choose default filename if caller didn't pass one ---
+    if outfile:
+        out_path: str = outfile
+    else:
+        if filename_mode == "number":
+            base = _network_number_from_name(network_name) or _network_tag_from_name(network_name)
+        else:  # "name"
+            base = _network_tag_from_name(network_name)
+        out_path = f"{_slug_filename(base)}_{timestamp}.xlsx"
+        
     wb: Workbook = Workbook()
     ws: Worksheet = cast(Worksheet, wb.active)
     ws.title = "Snapshot"
