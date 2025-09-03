@@ -1,11 +1,7 @@
-# Created by J A Said
-# Rebinds network to a New Template
-# Template is auto selected based on the model of MX that is been added 
-# Roll back functionality updated
-#   20250818 - graceful exit if either org or network not selected
-#   20250818 - updated logic to handle blank serials
-#   20250818 - updated rollback function
-#   20250902 - updated rollback font to make it more prominent
+# Created by JS 
+# uses the native python library to rebind a meraki network to a new template 
+    # allows the claiming and addining of new devices to the network replacing old devices / models
+
 
 import requests
 import logging
@@ -19,6 +15,12 @@ import time
 import signal
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Set, Union
+from openpyxl import Workbook
+from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.utils import get_column_letter
+from typing import cast
+import unicodedata
+
 
 # =====================
 # Config & Constants
@@ -123,7 +125,8 @@ else:
 
 HEADERS = {
     "X-Cisco-Meraki-API-Key": API_KEY,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "Accept": "application/json",
 }
 
 # Graceful abort
@@ -162,7 +165,14 @@ def _request(method: str, path: str, *, params=None, json_data=None) -> Any:
                 raise ValueError("Unknown HTTP method")
 
             if resp.status_code == 429:
-                wait = min(2 ** (attempt - 1), 30)
+                ra = resp.headers.get("Retry-After")
+                if ra is not None:
+                    try:
+                        wait = max(0.5, min(float(ra), 30.0))
+                    except ValueError:
+                        wait = min(2 ** (attempt - 1), 30)
+                else:
+                    wait = min(2 ** (attempt - 1), 30)
                 logging.warning(f"429 rate limit for {url}. Sleeping {wait}s and retrying...")
                 time.sleep(wait)
                 continue
@@ -205,9 +215,181 @@ def meraki_delete(path):
 
 def do_action(func, *args, **kwargs):
     if DRY_RUN:
-        logging.debug(f"DRY RUN: {func.__name__} args={args} kwargs={kwargs}")
+        logging.debug(f"DRY RUN: {getattr(func, '__name__', str(func))} args={args} kwargs={kwargs}")
         return None
     return func(*args, **kwargs)
+
+# ======================================================
+# ------------- Wireless pre-check helpers -------------
+# ======================================================
+from typing import Optional, List, Dict, Any, Tuple, Set
+
+WIRELESS_PREFIXES: Tuple[str, ...] = ("MR", "CW")
+
+def _is_wireless_model(model: Optional[str]) -> bool:
+    return bool(model) and model.upper().startswith(WIRELESS_PREFIXES)
+
+def _is_mr33(model: Optional[str]) -> bool:
+    return bool(model) and model.upper().startswith("MR33")
+
+def _get_network_wireless_devices(network_id: str) -> List[Dict[str, Any]]:
+    try:
+        devices: List[Dict[str, Any]] = meraki_get(f"/networks/{network_id}/devices") or []
+    except Exception:
+        logging.exception("Failed to list devices for wireless check")
+        return []
+    return [d for d in devices if _is_wireless_model(d.get("model"))]
+
+def _get_inventory_models_for_serials(org_id: str, serials: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for s in serials:
+        try:
+            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}") or {}
+            mdl = inv.get("model")
+            if mdl:
+                out[s] = mdl
+        except Exception:
+            logging.exception("Inventory lookup failed for %s", s)
+    return out
+
+def _prompt_yes_no(question: str, default_no: bool = True) -> bool:
+    prompt = " [y/N] " if default_no else " [Y/n] "
+    ans_raw = input(question + prompt).strip().lower()
+    if not ans_raw:
+        return (not default_no)
+    return ans_raw in ("y", "yes")
+
+def _prompt_replacement_mapping(old_serials: List[str], new_serials: List[str]) -> List[Tuple[str, str]]:
+    if not old_serials or not new_serials:
+        return []
+    print("\nEnter replacement pairs as 'OLD:NEW'. Leave blank to finish.")
+    print(f"Old (present in network): {', '.join(old_serials)}")
+    print(f"New (available to add):   {', '.join(new_serials)}")
+
+    available_new: Set[str] = {s.upper() for s in new_serials}
+    old_upper: Set[str] = {s.upper() for s in old_serials}
+    mapping: List[Tuple[str, str]] = []
+
+    def _restore_case(target: str, pool: List[str]) -> str:
+        for p in pool:
+            if p.upper() == target.upper():
+                return p
+        return target
+
+    while True:
+        line = input("Pair (OLD:NEW): ").strip()
+        if not line:
+            break
+        if ":" not in line:
+            print("  Format must be OLD:NEW")
+            continue
+        old_s, new_s = [p.strip() for p in line.split(":", 1)]
+        if old_s.upper() not in old_upper:
+            print(f"  {old_s} is not in the old-serials list.")
+            continue
+        if new_s.upper() not in available_new:
+            print(f"  {new_s} is not in the new-serials list or already used.")
+            continue
+        mapping.append((_restore_case(old_s, old_serials), _restore_case(new_s, new_serials)))
+        available_new.remove(new_s.upper())
+    return mapping
+
+def ensure_mr33_and_handle_wireless_replacements(
+    org_id: str,
+    network_id: str,
+    serials_to_add: List[str],
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    If incoming list contains wireless, ensure there is/was an MR33 in the network or incoming.
+    Optionally replace non-MR33 wireless already in the network with incoming wireless units.
+    Returns: (serials_to_add_excluding_already_claimed_wireless, removed_old_wireless, claimed_new_wireless)
+    """
+    add_models: Dict[str, str] = _get_inventory_models_for_serials(org_id, serials_to_add)
+    incoming_wireless: List[str] = [s for s, m in add_models.items() if _is_wireless_model(m)]
+    if not incoming_wireless:
+        return serials_to_add, [], []
+
+    wireless_now = _get_network_wireless_devices(network_id)
+    has_mr33_now = any(_is_mr33(d.get("model")) for d in wireless_now)
+    non_mr33_in_net = [
+        d for d in wireless_now if _is_wireless_model(d.get("model")) and not _is_mr33(d.get("model"))
+    ]
+    adding_has_mr33 = any(_is_mr33(add_models.get(s)) for s in incoming_wireless)
+
+    if not has_mr33_now and not adding_has_mr33:
+        if not _prompt_yes_no("No MR33 detected in network or incoming. Proceed anyway?", default_no=True):
+            print("Aborting per user input (no MR33).")
+            raise SystemExit(1)
+
+    removed_old: List[str] = []
+    claimed_new: List[str] = []
+
+    if non_mr33_in_net and _prompt_yes_no("Replace non-MR33 wireless with incoming?", default_no=False):
+        mapping = _prompt_replacement_mapping(
+            [str(d.get("serial")) for d in non_mr33_in_net if d.get("serial")],
+            incoming_wireless
+        )
+        for old_serial, new_serial in mapping:
+            try:
+                # Clear metadata, then remove from network
+                do_action(meraki_put, f"/devices/{old_serial}", data={"name": "", "address": ""})
+                do_action(meraki_post, f"/networks/{network_id}/devices/remove", data={"serial": old_serial})
+                log_change('wireless_replace_remove', f"Removed old wireless {old_serial}", device_serial=old_serial)
+                removed_old.append(old_serial)
+            except Exception:
+                logging.exception("Failed to remove %s", old_serial)
+
+            try:
+                # Claim the replacement
+                do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": [new_serial]})
+                log_change('wireless_replace_claim', f"Claimed new wireless {new_serial}", device_serial=new_serial)
+                claimed_new.append(new_serial)
+            except Exception:
+                logging.exception("Failed to claim %s", new_serial)
+
+    # Exclude any wireless we just claimed from the still-to-claim list
+    claimed_new_set: Set[str] = set(claimed_new)
+    serials_to_add_remaining = [s for s in serials_to_add if s not in claimed_new_set]
+
+    return serials_to_add_remaining, removed_old, claimed_new
+
+def run_wireless_precheck_and_filter_claims(
+    org_id: str,
+    network_id: str,
+    prevalidated_serials: List[str],
+    *,
+    block_wireless: bool = False,  # default: allow wireless to be claimed
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Runs ensure_mr33_and_handle_wireless_replacements(), handles exceptions safely,
+    and returns a version of serials that excludes anything we already claimed in
+    the helper. By default, does NOT block wireless from being claimed.
+    Set block_wireless=True if you explicitly want to prevent claiming MR/CW.
+    """
+    mr_removed_serials: List[str] = []
+    mr_claimed_serials: List[str] = []
+
+    try:
+        prevalidated_serials, mr_removed_serials, mr_claimed_serials = ensure_mr33_and_handle_wireless_replacements(
+            org_id, network_id, prevalidated_serials
+        )
+    except SystemExit:
+        raise
+    except Exception:
+        logging.exception("Wireless pre-check/replacement step failed")
+
+    # Only block wireless if explicitly requested
+    if block_wireless:
+        inv_models = _get_inventory_models_for_serials(org_id, prevalidated_serials)
+        wireless_block = {s for s, m in inv_models.items() if _is_wireless_model(m)}
+    else:
+        wireless_block = set()
+
+    do_not_claim = wireless_block | set(mr_claimed_serials)  # avoid double-claiming what helper already claimed
+    safe_to_claim = [s for s in prevalidated_serials if s not in do_not_claim]
+
+    return safe_to_claim, mr_removed_serials, mr_claimed_serials
+
 
 # =====================
 # VLAN error detector (robust)
@@ -320,7 +502,7 @@ def fetch_devices(
     ms = [_mk(d) for d in devs if d['model'].startswith('MS')]
     mr = [_mk(d) for d in devs if d['model'].startswith('MR') or d['model'].startswith('CW916')]
 
-    # Per-MS port overrides vs current template profile (if known)
+    # Per-MS port overrides vs template profile (if known)
     if template_id:
         for sw in ms:
             profile_id = sw.get('switchProfileId')
@@ -329,7 +511,9 @@ def fetch_devices(
                 continue
             try:
                 live_ports = meraki_get(f"/devices/{sw['serial']}/switch/ports")
-                tmpl_ports = meraki_get(f"/organizations/{org_id}/configTemplates/{template_id}/switch/profiles/{profile_id}/ports")
+                tmpl_ports = meraki_get(
+                    f"/organizations/{org_id}/configTemplates/{template_id}/switch/profiles/{profile_id}/ports"
+                )
                 sw['port_overrides'] = compute_port_overrides(live_ports, tmpl_ports)
                 logging.debug(f"Computed {len(sw['port_overrides'])} port overrides for {sw['serial']}")
             except Exception:
@@ -403,7 +587,7 @@ def classify_serials_for_binding(org_id: str, net_id: str, serials: List[str]):
     already, elsewhere, avail = [], [], []
     for s in serials:
         try:
-            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
+            inv = meraki_get(f"/organizations/{org_id}/inventory/devices/{s}")
             nid = inv.get('networkId')
             if nid == net_id:
                 already.append(s)
@@ -447,29 +631,17 @@ def remove_existing_mx64_devices(org_id: str, network_id: str) -> bool:
 def remove_existing_MR33_devices(org_id: str, network_id: str) -> bool:
     return _clear_and_remove_models(org_id, network_id, ("MR33",))
 
+
 # ---------- Prompt + claim into ORG (before selecting network) ----------
 def prompt_and_validate_serials(org_id: str) -> List[str]:
     """
-    Ask for intended device count, then collect serials via:
-      - one comma-separated line, OR
-      - multiple lines (press Enter on a blank line to finish)
-
-    - If provided count != entered count, prompt to re-enter or proceed anyway.
-    - Validate each serial individually:
-        * Format XXXX-XXXX-XXXX (up to 4 attempts per serial)
-        * If not in org inventory (404), attempt to claim into org
-    - Dedupes within the same entry (preserving order) and warns.
-    Exits gracefully after 4 consecutive blank attempts at entering serials.
-
-    NOTE: In multi-line mode, pressing Enter after entering at least one serial
-    simply finishes input and DOES NOT count as a "blank attempt". The blank
-    attempt limit only applies when no serials were entered at all for that try.
+    Ask for intended device count, then collect serials via CSV or multi-line input.
+    Validates format (XXXX-XXXX-XXXX), looks up in org inventory, and claims if 404.
     """
     MAX_SERIAL_ATTEMPTS = 4
     MAX_BLANK_ATTEMPTS = 4
     serial_pattern = re.compile(r"[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}")
 
-    # 1) Ask intended count
     while True:
         count_raw = input("How many devices/serials will you add to this org? (Enter to skip): ").strip()
         if not count_raw:
@@ -483,7 +655,6 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
         except ValueError:
             print("ℹ️  Please enter a whole number (e.g., 3).")
 
-    # 2) Outer loop to re-enter the full list on mismatch
     blank_attempts = 0
     while True:
         print("\nEnter serial numbers:")
@@ -491,16 +662,12 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
         print(" - OR enter one per line and press Enter on a blank line to finish.\n")
         first_line = input("Enter serial(s): ").strip().upper()
 
-        # Collect raw serials (either CSV or multiline)
         raw_serials: List[str] = []
         if "," in first_line:
-            # CSV mode (single line)
             raw_serials = [s.strip().upper() for s in first_line.split(",") if s.strip()]
         else:
-            # Multiline mode
             if first_line:
                 raw_serials.append(first_line)
-            # IMPORTANT: blank after at least one serial just finishes input and is NOT a "blank attempt"
             while True:
                 nxt = input("Enter next serial (or blank to finish): ").strip().upper()
                 if not nxt:
@@ -517,7 +684,7 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
             print(f"ℹ️  No serials provided. Try again. (attempt {blank_attempts}/{MAX_BLANK_ATTEMPTS})")
             continue
 
-        # Split/trim already done; now dedupe preserving order
+        # dedupe preserving order
         seen: Set[str] = set()
         serial_list: List[str] = []
         for s in raw_serials:
@@ -532,17 +699,14 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
             print(f"⚠️  You said {intended_count} device(s) but entered {entered_count}.")
             choice = input("Proceed anyway? (yes to proceed / no to re-enter): ").strip().lower()
             if choice not in {"y", "yes"}:
-                # reset blank attempts when user is actively re-entering
                 blank_attempts = 0
-                continue  # re-enter list
+                continue
 
-        # 3) Validate each serial
         collected: List[str] = []
         for idx, original_serial in enumerate(serial_list, start=1):
             attempts = 0
             serial = original_serial
             while attempts < MAX_SERIAL_ATTEMPTS:
-                # Format check
                 if not serial_pattern.fullmatch(serial or ""):
                     attempts += 1
                     if attempts >= MAX_SERIAL_ATTEMPTS:
@@ -553,17 +717,19 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
                     ).strip().upper()
                     continue
 
-                # Inventory check
                 try:
-                    meraki_get(f"/organizations/{org_id}/inventoryDevices/{serial}")
+                    meraki_get(f"/organizations/{org_id}/inventory/devices/{serial}")
                     print(f"✅ {serial} found in org inventory.")
                     collected.append(serial)
                     break
                 except MerakiAPIError as e:
-                    # Not found in org -> claim
                     if getattr(e, "status_code", None) == 404:
                         try:
-                            do_action(meraki_post, f"/organizations/{org_id}/claim", data={"serials": [serial]})
+                            do_action(
+                                meraki_post,
+                                f"/organizations/{org_id}/inventory/claim",
+                                data={"serials": [serial]},
+                            )
                             print(f"✅ Serial '{serial}' successfully claimed into org inventory.")
                             log_change('device_claimed_inventory', "Claimed serial into org inventory", device_serial=serial)
                             collected.append(serial)
@@ -585,14 +751,12 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
                     print(f"API Error for serial '{serial}': {e}")
                     break
 
-        # 4) Final check vs intended
         if len(collected) != intended_count:
             print(f"⚠️  Intended: {intended_count}, Entered: {entered_count}, Validated: {len(collected)}.")
             choice = input("Proceed with validated devices anyway? (yes to proceed / no to re-enter all): ").strip().lower()
             if choice in {"y", "yes"}:
                 return collected
             else:
-                # reset blank attempts when user is actively re-entering
                 blank_attempts = 0
                 print("Okay, let's re-enter the serial list.")
                 continue
@@ -608,7 +772,7 @@ def summarize_devices_in_org(org_id: str, serials: List[str]) -> Set[str]:
     print("\nValidated / added to organization:")
     for s in serials:
         try:
-            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
+            inv = meraki_get(f"/organizations/{org_id}/inventory/devices/{s}")
             model = inv.get('model') or 'Unknown'
             ptypes = inv.get('productTypes') or []
             ptype = ptypes[0] if isinstance(ptypes, list) and ptypes else inv.get('productType') or 'Unknown'
@@ -644,7 +808,7 @@ def claim_devices(org_id: str, network_id: str, prevalidated_serials: Optional[L
     mx_models: List[str] = []
     for s in avail:
         try:
-            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
+            inv = meraki_get(f"/organizations/{org_id}/inventory/devices/{s}")
             if (inv.get('model') or '').startswith('MX'):
                 mx_models.append(inv['model'])
         except Exception:
@@ -668,14 +832,10 @@ def claim_devices(org_id: str, network_id: str, prevalidated_serials: Optional[L
 
 # ---------- ORDERING HELPERS ----------
 def select_primary_mx(org_id: str, serials: List[str]) -> Optional[str]:
-    """
-    If multiple MX are present, ask which should be PRIMARY (mx-01).
-    If user presses Enter or types 'skip'/'cancel', auto-select the MX with the lowest serial.
-    """
     mx_candidates: List[Tuple[str, str]] = []
     for s in serials:
         try:
-            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
+            inv = meraki_get(f"/organizations/{org_id}/inventory/devices/{s}")
             model = (inv.get('model') or '').upper()
             if model.startswith('MX'):
                 mx_candidates.append((s, model))
@@ -708,16 +868,10 @@ def select_primary_mx(org_id: str, serials: List[str]) -> Optional[str]:
     return auto_choice
 
 def select_device_order(org_id: str, serials: List[str], kind: str) -> List[str]:
-    """
-    Choose an explicit order for devices of a given type (MR/CW916 or MS).
-    If user presses Enter / 'skip'/'cancel', auto-order by serial (alphanumeric).
-    kind must be 'MR' or 'MS'.
-    Returns ordered list of serials for that kind.
-    """
     filtered: List[Tuple[str, str]] = []  # (serial, model)
     for s in serials:
         try:
-            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
+            inv = meraki_get(f"/organizations/{org_id}/inventory/devices/{s}")
             model = (inv.get('model') or '').upper()
             if kind == 'MR' and (model.startswith('MR') or model.startswith('CW916')):
                 filtered.append((s, model))
@@ -750,14 +904,6 @@ def select_device_order(org_id: str, serials: List[str], kind: str) -> List[str]
 
 # ---------- Warm spare primary enforcement ----------
 def ensure_primary_mx(network_id: str, desired_primary_serial: Optional[str]) -> None:
-    """
-    Ensure the warm spare primary equals the serial selected as mx-01.
-    If warm spare is enabled and the current primary != desired, perform a swap.
-
-    Uses:
-      GET  /networks/{networkId}/appliance/warmSpare
-      POST /networks/{networkId}/appliance/warmSpare/swap
-    """
     if not desired_primary_serial:
         return
 
@@ -806,34 +952,27 @@ def name_and_configure_claimed_devices(
 ):
     """
     Renames and configures newly-claimed devices using optional ordering.
-    - primary_mx_serial: that MX becomes ...-mx-01 (others mx-02, mx-03, ...)
-    - mr_order: explicit AP order (first -> ...-ap-01)
-    - ms_order: explicit switch order (first -> ...-ms-01)
     """
     prefix = '-'.join(network_name.split('-')[:2]).lower()
     counts = {'MX': 1, 'MR': 1, 'MS': 1}
     old_mr33s = sorted([d for d in (old_mr_devices or []) if d['model'] == 'MR33'], key=lambda x: x.get('name', ''))
     old_mxs_sorted = sorted((old_mx_devices or []) if old_mx_devices else [], key=lambda x: x.get('name', ''))
 
-    # Lookup models once
     inv_by_serial: Dict[str, Dict[str, Any]] = {}
     for s in serials:
         try:
-            inv_by_serial[s] = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
+            inv_by_serial[s] = meraki_get(f"/organizations/{org_id}/inventory/devices/{s}")
         except Exception:
             logging.exception(f"Failed inventory lookup for {s}")
             inv_by_serial[s] = {}
 
-    # Partition
     mx_serials = [s for s in serials if (inv_by_serial.get(s, {}).get('model') or '').upper().startswith('MX')]
     mr_serials = [s for s in serials if any((inv_by_serial.get(s, {}).get('model') or '').upper().startswith(p) for p in ('MR', 'CW916'))]
     ms_serials = [s for s in serials if (inv_by_serial.get(s, {}).get('model') or '').upper().startswith('MS')]
 
-    # MX ordering: selected primary first
     if primary_mx_serial and primary_mx_serial in mx_serials:
         mx_serials = [primary_mx_serial] + [s for s in mx_serials if s != primary_mx_serial]
 
-    # MR / MS ordering override
     if mr_order:
         mr_serials = [s for s in mr_order if s in mr_serials]
     if ms_order:
@@ -937,10 +1076,7 @@ def list_and_rebind_template(
 ) -> Tuple[Optional[str], Optional[str], bool]:
     """
     Interactive template selection & (re)bind with robust rollback behavior.
-
     Returns: (new_template_id, new_template_name, rolled_back)
-      - If rollback was performed within this function (due to 2x skip/cancel or bind failure), rolled_back=True.
-      - On normal completion (bound or no change), rolled_back=False.
     """
     skip_attempts = 0
 
@@ -963,7 +1099,6 @@ def list_and_rebind_template(
         else:
             print("No template bound.\n")
 
-        # Fetch and optionally filter templates by suffix (MX67/MX75)
         temps = meraki_get(f"/organizations/{org_id}/configTemplates")
         filtered = temps
         if mx_model_filter in {'MX67', 'MX75'}:
@@ -980,14 +1115,12 @@ def list_and_rebind_template(
             "Select template # (or press Enter / type 'skip'/'cancel' to cancel — a second cancel will ROLLBACK): "
         ).strip().lower()
 
-        # Skip/cancel handling with rollback on second time
         if sel in {"", "skip", "cancel"}:
             skip_attempts += 1
             if skip_attempts == 1:
                 print("⚠️  You chose to cancel template selection.")
                 print("If you cancel again, the process will be ROLLED BACK immediately.")
                 continue
-            # Second cancel -> rollback entire session state using provided snapshots
             print("🚨 Cancelled twice — initiating rollback...")
             log_change('rollback_trigger', 'User cancelled twice during template selection')
             rollback_all_changes(
@@ -1017,13 +1150,9 @@ def list_and_rebind_template(
             print("No change (already bound to that template).")
             return current_id, chosen['name'], False
 
-        # Attempt to unbind (if currently bound) and bind the new template
         try:
-            # Unbind (safe: if not bound, skip)
             if current_id:
                 do_action(meraki_post, f"/networks/{network_id}/unbind")
-
-            # Bind the new template
             do_action(meraki_post, f"/networks/{network_id}/bind", data={"configTemplateId": chosen['id']})
             log_change('template_bind',
                        f"Bound to template {chosen['name']} (ID: {chosen['id']})",
@@ -1032,9 +1161,8 @@ def list_and_rebind_template(
             return chosen['id'], chosen['name'], False
 
         except MerakiAPIError as e:
-            # If we already unbound and bind failed, or VLANs disabled, roll back
             logging.error(f"Error binding template: {e}")
-            must_rollback = True if current_id else False  # we unbound; network is mid-change
+            must_rollback = True if current_id else False
             if is_vlans_disabled_error(e):
                 print("❌ VLANs are not enabled for this network. Binding failed and state may be partial.")
                 must_rollback = True
@@ -1152,7 +1280,7 @@ def select_switch_profile_interactive_by_model(tpl_profiles: List[Dict[str, Any]
 
 def device_in_inventory(org_id: str, serial: str) -> bool:
     try:
-        inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{serial}")
+        inv = meraki_get(f"/organizations/{org_id}/inventory/devices/{serial}")
         return inv.get('networkId') is None
     except Exception:
         return False
@@ -1308,16 +1436,165 @@ def print_summary(step_status: Dict[str, StatusVal]) -> None:
             continue  # skip N/A lines entirely
         print(f" - {step}: {_fmt(val)}")
 
+def _slug_filename(s: str) -> str:
+    # keep letters, numbers, dot, underscore, hyphen; replace others with '-'
+    s = re.sub(r'[^A-Za-z0-9._-]+', '-', s).strip('-_')
+    return s[:80]  # keep it tidy
+
+def _network_tag_from_name(name: str) -> str:
+    # If your convention is "UK-0593-Whatever", return "UK-0593"
+    parts = name.split('-')
+    if len(parts) >= 2 and parts[1].isdigit():
+        return f"{parts[0]}-{parts[1]}"
+    return name
+
+def _network_number_from_name(name: str) -> str | None:
+    # Grab the first standalone number block (e.g., 0593)
+    m = re.search(r'\b(\d{2,8})\b', name)
+    return m.group(1) if m else None
+
+def export_network_snapshot_xlsx(
+    org_id: str,
+    network_id: str,
+    network_name: str,
+    template_id: Optional[str],
+    vlan_list: List[Dict[str, Any]],
+    mx_list: List[Dict[str, Any]],
+    ms_list: List[Dict[str, Any]],
+    mr_list: List[Dict[str, Any]],
+    profileid_to_name: Optional[Dict[str, str]] = None,
+    outfile: Optional[str] = None,
+    filename_mode: str = "name",  # "name" | "number"
+) -> None:
+    def _json(x: Any) -> str:
+        try:
+            return json.dumps(x, ensure_ascii=False)
+        except Exception:
+            return str(x)
+
+    # filename
+    if outfile:
+        out_path: str = outfile
+    else:
+        if filename_mode == "number":
+            base = _network_number_from_name(network_name) or _network_tag_from_name(network_name)
+        else:  # "name"
+            base = _network_tag_from_name(network_name)
+        out_path = f"{_slug_filename(base)}_{timestamp}.xlsx"
+
+    wb: Workbook = Workbook()
+    ws: Worksheet = cast(Worksheet, wb.active)
+    ws.title = "Snapshot"
+
+    header: List[str] = [
+        "section", "network_id", "network_name", "item_type",
+        "col1", "col2", "col3", "col4", "col5",
+        "switch_profile_id", "switch_profile_name", "extra_info"
+    ]
+    ws.append(header)
+
+    # template name (via REST layer used by the script)
+    tpl_name: str = ""
+    if template_id:
+        try:
+            tpl = meraki_get(f"/organizations/{org_id}/configTemplates/{template_id}")
+            tpl_name = str(tpl.get("name", "") or "")
+        except Exception:
+            logging.exception("Could not fetch template name for snapshot")
+
+    ws.append([
+        "template", network_id, network_name, "template",
+        template_id or "", tpl_name, "", "", "",
+        "", "", ""
+    ])
+
+    # VLAN rows
+    for v in vlan_list:
+        ws.append([
+            "vlans", network_id, network_name, "vlan",
+            str(v.get("id", "")),
+            str(v.get("name", "") or ""),
+            str(v.get("subnet", "") or ""),
+            str(v.get("applianceIp", "") or ""),
+            str(v.get("dhcpHandling", "") or ""),
+            "", "",
+            _json({k: v.get(k) for k in v.keys() - {"id", "name", "subnet", "applianceIp", "dhcpHandling"}}),
+        ])
+
+    # device rows
+    def _device_row(d: Dict[str, Any]) -> List[str]:
+        tags_val = d.get("tags", [])
+        if isinstance(tags_val, list):
+            tags_list = [str(t) for t in tags_val]
+        else:
+            tags_list = [t for t in str(tags_val or "").split() if t]
+
+        sp_id: str = str(d.get("switchProfileId", "") or "")
+        sp_name: str = str(d.get("switchProfileName", "") or "")
+        if (not sp_name) and sp_id and profileid_to_name:
+            sp_name = profileid_to_name.get(sp_id, "") or ""
+
+        return [
+            "devices", network_id, network_name, "device",
+            str(d.get("serial", "") or ""),
+            str(d.get("model", "") or ""),
+            str(d.get("name", "") or ""),
+            str(d.get("address", "") or ""),
+            " ".join(tags_list),
+            sp_id,
+            sp_name,
+            ""
+        ]
+
+    for d in (mx_list + ms_list + mr_list):
+        ws.append(_device_row(d))
+
+    # MS port overrides
+    for sw in ms_list:
+        changes_by_port: Dict[str, Dict[str, Any]] = sw.get("port_overrides") or {}
+        if not isinstance(changes_by_port, dict) or not changes_by_port:
+            continue
+        for port_id, changes in changes_by_port.items():
+            if not isinstance(changes, dict):
+                continue
+            for fld, val in changes.items():
+                ws.append([
+                    "port_overrides", network_id, network_name, "port_override",
+                    str(sw.get("serial", "") or ""), str(port_id), str(fld),
+                    "" if isinstance(val, (dict, list)) else str(val),
+                    "", "", "",
+                    _json(val) if isinstance(val, (dict, list)) else "",
+                ])
+
+    # autosize columns
+    max_col: int = ws.max_column
+    max_row: int = ws.max_row
+    for col_idx in range(1, max_col + 1):
+        max_len = 0
+        for row_idx in range(1, max_row + 1):
+            val = ws.cell(row=row_idx, column=col_idx).value
+            if val is not None:
+                s = str(val)
+                if len(s) > max_len:
+                    max_len = len(s)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
+
+    wb.save(out_path)
+    print(f"📄 Snapshot exported to Excel: {out_path}")
+    log_change("snapshot_export", f"Exported network snapshot to {out_path}",
+               network_id=network_id, network_name=network_name)
+
+
+
 # =====================
 # Robust network selector
 # =====================
 def select_network_interactive(org_id: str) -> Tuple[str, str]:
-    """Robust interactive network selector. Returns (network_id, network_name) or (None, None) if cancelled."""
     while True:
         partial = input("Enter partial network name to search (or press Enter to cancel): ").strip()
         if not partial:
             print("\n❌ No Network selected -----------\n   Please retry when Network is known *******")
-        sys.exit(1)
+            sys.exit(1)
 
         networks = fetch_matching_networks(org_id, partial)
         if not networks:
@@ -1325,8 +1602,8 @@ def select_network_interactive(org_id: str) -> Tuple[str, str]:
             retry = input("Search again? (y/N): ").strip().lower()
             if retry != 'y':
                 print("\n❌ No Network selected -----------\n   Please retry when Network is known *******")
-        sys.exit(1)
-        continue
+                sys.exit(1)
+            continue
 
         if len(networks) == 1:
             only = networks[0]
@@ -1336,10 +1613,8 @@ def select_network_interactive(org_id: str) -> Tuple[str, str]:
                 print(f"Selected network: {only['name']} (ID: {only['id']})")
                 return only['id'], only['name']
             else:
-                # let them search again
                 continue
 
-        # Multiple matches
         print("\nMultiple networks found:")
         for idx, net in enumerate(networks, 1):
             print(f"{idx}. {net['name']} (ID: {net['id']})")
@@ -1348,14 +1623,14 @@ def select_network_interactive(org_id: str) -> Tuple[str, str]:
             raw = input("Select the network by number (or press Enter to cancel): ").strip()
             if not raw:
                 print("\n❌ No Network selected -----------\n   Please retry when Network is known *******")
-        sys.exit(1)
-        if raw.isdigit():
+                sys.exit(1)
+            if raw.isdigit():
                 choice = int(raw)
                 if 1 <= choice <= len(networks):
                     chosen = networks[choice - 1]
                     print(f"Selected network #{choice}: {chosen['name']} (ID: {chosen['id']})")
                     return chosen['id'], chosen['name']
-        print("❌ Invalid selection. Please enter a valid number from the list.")
+            print("❌ Invalid selection. Please enter a valid number from the list.")
 
 # =====================
 # Org selector
@@ -1390,8 +1665,6 @@ def select_org() -> str:
 
 # ------------- Change Rollback Font -------------
 def prompt_rollback_big() -> str:
-    # Import locally so names are always bound for Pylance,
-    # and gracefully fall back if Rich/pyfiglet isn't installed.
     try:
         from rich.console import Console
         from rich.panel import Panel
@@ -1433,36 +1706,62 @@ if __name__ == '__main__':
 
     step_status: Dict[str, StatusVal] = {}
 
-    # -------- Select Org (graceful cancel/invalid) --------
+    # -------- Select Org --------
     org_id = select_org()
 
-    # -------- Prompt/validate serials now (org-level), then summarize --------
+    # -------- Prompt/validate serials (org-level), then summarize --------
     prevalidated_serials = prompt_and_validate_serials(org_id)
     detected_mx_models = summarize_devices_in_org(org_id, prevalidated_serials)
 
-    mx_model_filter = None
+    mx_model_filter: Optional[str] = None
     if detected_mx_models == {'MX67'}:
         mx_model_filter = 'MX67'
     elif detected_mx_models == {'MX75'}:
         mx_model_filter = 'MX75'
 
-    # -------- Select Network (robust) --------
+    # -------- Select Network --------
     network_id, network_name = select_network_interactive(org_id)
 
     net_info = meraki_get(f"/networks/{network_id}")
-    old_template = net_info.get('configTemplateId')
+    old_template: Optional[str] = net_info.get('configTemplateId')
 
-    # Pre-change snapshot incl. MS port overrides
+    # -------- Pre-change snapshot incl. MS port overrides --------
     mx, ms, mr = fetch_devices(org_id, network_id, template_id=old_template)
     pre_change_devices = mx + ms + mr
     pre_change_vlans = fetch_vlan_details(network_id)
     pre_change_template = old_template
-    pre_change_serials = {d['serial'] for d in pre_change_devices}
+    pre_change_serials: Set[str] = {d['serial'] for d in pre_change_devices}
 
-    # MX gate: if current MX model is NOT MX64, skip rebind/VLAN path
+    # For snapshot/xlsx mapping: template profileId -> name
+    old_profileid_to_name: Dict[str, str] = {}
+    if old_template:
+        try:
+            old_tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{old_template}/switch/profiles") or []
+            old_profileid_to_name = {p['switchProfileId']: p['name'] for p in old_tpl_profiles}
+        except Exception:
+            logging.exception("Failed fetching old template switch profiles")
+
+    # --- Export PRE snapshot ---
+    export_network_snapshot_xlsx(
+        org_id=org_id,
+        network_id=network_id,
+        network_name=network_name,
+        template_id=old_template,
+        vlan_list=pre_change_vlans,
+        mx_list=mx,
+        ms_list=ms,
+        mr_list=mr,
+        profileid_to_name=old_profileid_to_name,
+        outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_pre_{timestamp}.xlsx",
+    )
+
+    # -------- MX gate --------
     current_mx_models = sorted({d['model'] for d in mx})
     is_mx64_present = any(m.startswith('MX64') for m in current_mx_models)
 
+    # ------------------------------------------------------------------
+    # PATH A: Current network has MX (not MX64) -> light flow (no rebind)
+    # ------------------------------------------------------------------
     if current_mx_models and not is_mx64_present:
         print(f"\nCurrent network: {network_name} (ID: {network_id})")
         if old_template:
@@ -1479,19 +1778,24 @@ if __name__ == '__main__':
         step_status['vlans_updated'] = "NA"
         step_status['mx_removed'] = "NA"
 
-        claimed = claim_devices(org_id, network_id, prevalidated_serials=prevalidated_serials)
+        # --- wireless MR33 pre-check + hard guard ---
+        safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
+        org_id, network_id, prevalidated_serials  # allow wireless
+        )
+        claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
+
         step_status['devices_claimed'] = bool(claimed)
 
-        # Choose primary/order (auto if Enter/skip/cancel)
+        # Order / primary selection
         primary_mx_serial = select_primary_mx(org_id, claimed)
-        ensure_primary_mx(network_id, primary_mx_serial)  # ensure warm spare primary
+        ensure_primary_mx(network_id, primary_mx_serial)
         mr_order = select_device_order(org_id, claimed, 'MR')
         ms_order = select_device_order(org_id, claimed, 'MS')
 
+        # Fetch template profiles (if any) for post-claim config
         try:
-            tpl_profiles = []
             if old_template:
-                tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{old_template}/switch/profiles")
+                tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{old_template}/switch/profiles") or []
                 tpl_profile_map = {p['name']: p['switchProfileId'] for p in tpl_profiles}
             else:
                 tpl_profile_map = {}
@@ -1501,15 +1805,16 @@ if __name__ == '__main__':
             tpl_profile_map = {}
             tpl_profiles = []
 
+        # Naming & configuration for claimed devices
         try:
             name_and_configure_claimed_devices(
-                org_id,
-                network_id,
-                network_name,
-                claimed,
-                ms,
-                mr,
-                tpl_profile_map,
+                org_id=org_id,
+                network_id=network_id,
+                network_name=network_name,
+                serials=claimed,
+                ms_list=ms,
+                mr_list=mr,
+                tpl_profile_map=tpl_profile_map,
                 old_mx_devices=mx,
                 old_mr_devices=mr,
                 primary_mx_serial=primary_mx_serial,
@@ -1520,12 +1825,18 @@ if __name__ == '__main__':
         except Exception:
             logging.exception("Configuration of claimed devices failed")
             step_status['configured'] = False
-
+       
+    # Remove legacy MR33 only if we actually claimed any wireless device
         try:
-            removed_mr33_ok = remove_existing_MR33_devices(org_id, network_id)
-            step_status['mr33_removed'] = removed_mr33_ok
-            if removed_mr33_ok:
-                log_change('mr33_removed', "Removed old MR33 after new AP claim", misc=f"claimed_serials={claimed}")
+            inv_models_claimed = _get_inventory_models_for_serials(org_id, claimed)
+            claimed_has_wireless = any(_is_wireless_model(m) for m in inv_models_claimed.values())
+            if claimed_has_wireless:
+                removed_mr33_ok = remove_existing_MR33_devices(org_id, network_id)
+                step_status['mr33_removed'] = removed_mr33_ok
+                if removed_mr33_ok:
+                    log_change('mr33_removed', "Removed old MR33 after new AP claim", misc=f"claimed_serials={claimed}")
+            else:
+                step_status['mr33_removed'] = "NA"
         except Exception:
             logging.exception("MR33 removal failed")
             step_status['mr33_removed'] = False
@@ -1533,12 +1844,38 @@ if __name__ == '__main__':
         step_status.setdefault('old_mx', "NA")
         step_status.setdefault('old_mr33', "NA")
 
+        
+
         remove_recently_added_tag(network_id)
         print_summary(step_status)
 
+        # --- Export POST snapshot ---
+        final_mx, final_ms, final_mr = fetch_devices(org_id, network_id, template_id=old_template)
+        final_vlans = fetch_vlan_details(network_id)
+        final_tpl_id = meraki_get(f"/networks/{network_id}").get('configTemplateId')
+        final_profileid_to_name: Dict[str, str] = {}
+        if final_tpl_id:
+            try:
+                final_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{final_tpl_id}/switch/profiles") or []
+                final_profileid_to_name = {p['switchProfileId']: p['name'] for p in final_profiles}
+            except Exception:
+                logging.exception("Failed fetching final template switch profiles")
+
+        export_network_snapshot_xlsx(
+            org_id=org_id,
+            network_id=network_id,
+            network_name=network_name,
+            template_id=final_tpl_id,
+            vlan_list=final_vlans,
+            mx_list=final_mx,
+            ms_list=final_ms,
+            mr_list=final_mr,
+            profileid_to_name=final_profileid_to_name,
+            outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_post_{timestamp}.xlsx",
+        )
+
         # -------- Enhanced rollback prompt --------
         rollback_choice = prompt_rollback_big()
-
         if rollback_choice in {'yes', 'y'}:
             print("\nRolling back all changes...")
             log_change('rollback_start', 'User requested rollback')
@@ -1547,11 +1884,11 @@ if __name__ == '__main__':
             claimed_serials_rb = list(post_change_serials - pre_change_serials)
             removed_serials_rb = list(pre_change_serials - post_change_serials)
             rollback_all_changes(
-                network_id,
-                pre_change_devices,
-                pre_change_vlans,
-                pre_change_template,
-                org_id,
+                network_id=network_id,
+                pre_change_devices=pre_change_devices,
+                pre_change_vlans=pre_change_vlans,
+                pre_change_template=pre_change_template,
+                org_id=org_id,
                 claimed_serials=claimed_serials_rb,
                 removed_serials=removed_serials_rb,
                 ms_list=ms,
@@ -1559,11 +1896,9 @@ if __name__ == '__main__':
             )
             print("✅ Rollback complete.")
             log_change('rollback_end', 'Rollback completed')
-
         elif rollback_choice in {'no', 'n'}:
             print("\nProceeding without rollback. Rollback option will no longer be available.")
             log_change('workflow_end', 'Script finished (no rollback)')
-
         else:
             print("\n❌ No rollback selected (Enter pressed).")
             print("⚠️  Rollback is no longer available. Please ensure the network is functional and all required checks have been carried out.")
@@ -1571,27 +1906,25 @@ if __name__ == '__main__':
 
         raise SystemExit(0)
 
-    # ELSE: MX64 present -> proceed with full rebind/VLAN flow
+    # ------------------------------------------------------------------
+    # PATH B: MX64 present -> full rebind/VLAN flow
+    # ------------------------------------------------------------------
     vlan_list = fetch_vlan_details(network_id)
     old_mx, prebind_ms_devices, old_mr = fetch_devices(org_id, network_id, template_id=old_template)
-    ms_serial_to_profileid = {sw['serial']: sw.get('switchProfileId') for sw in prebind_ms_devices}
+    ms_serial_to_profileid: Dict[str, Optional[str]] = {sw['serial']: sw.get('switchProfileId') for sw in prebind_ms_devices}
+    prebind_overrides_by_serial: Dict[str, Dict[str, Any]] = {
+    sw['serial']: (sw.get('port_overrides') or {}) for sw in prebind_ms_devices
+    }
 
-    if old_template:
-        try:
-            old_tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{old_template}/switch/profiles")
-            old_profileid_to_name = {p['switchProfileId']: p['name'] for p in old_tpl_profiles}
-        except Exception:
-            logging.exception("Failed fetching old template switch profiles")
-            old_profileid_to_name = {}
-    else:
-        old_profileid_to_name = {}
+    # (old_profileid_to_name already prepared above)
 
+    # Choose & (re)bind template (with rollback on failure)
     try:
         new_template, _, rolled_back = list_and_rebind_template(
-            org_id,
-            network_id,
-            old_template,
-            network_name,
+            org_id=org_id,
+            network_id=network_id,
+            current_id=old_template,
+            network_name=network_name,
             pre_change_devices=pre_change_devices,
             pre_change_vlans=pre_change_vlans,
             pre_change_template=pre_change_template,
@@ -1612,9 +1945,14 @@ if __name__ == '__main__':
         new_template = old_template
         step_status['template_bound'] = False
 
+    # Validate VLANs after bind + update VLANs
     try:
         bind_network_to_template(
-            org_id, network_id, new_template, vlan_list, network_name,
+            org_id=org_id,
+            network_id=network_id,
+            tpl_id=new_template,
+            vlan_list=vlan_list,
+            network_name=network_name,
             pre_change_devices=pre_change_devices,
             pre_change_vlans=pre_change_vlans,
             pre_change_template=pre_change_template,
@@ -1629,47 +1967,68 @@ if __name__ == '__main__':
         logging.exception("VLAN update failed")
         step_status['vlans_updated'] = False
 
+    # Fetch new template profiles for post-bind MS mapping
     try:
         tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{new_template}/switch/profiles") if new_template else []
-        tpl_profile_map = {p['name']: p['switchProfileId'] for p in tpl_profiles}
+        tpl_profile_map = {p['name']: p['switchProfileId'] for p in (tpl_profiles or [])}
     except Exception:
         logging.exception("Failed fetch template switch profiles")
         tpl_profile_map = {}
         tpl_profiles = []
 
-    _, postbind_ms_devices, _ = fetch_devices(org_id, network_id)
+    # Re-assign switch profiles to match previous names / user choice (type-safe)
+    _, postbind_ms_devices, _ = fetch_devices(org_id, network_id, template_id=new_template)
+
     for sw in postbind_ms_devices:
-        old_profile_id = ms_serial_to_profileid.get(sw['serial'])
-        old_profile_name = old_profileid_to_name.get(old_profile_id)
+        serial = sw['serial']
+        old_profile_id = ms_serial_to_profileid.get(serial)
+        old_profile_name = old_profileid_to_name.get(old_profile_id) if isinstance(old_profile_id, str) else None
+
         new_profile_id = tpl_profile_map.get(old_profile_name) if old_profile_name else None
-        if not new_profile_id:
-            new_profile_id = select_switch_profile_interactive_by_model(tpl_profiles, tpl_profile_map, sw['model']) if tpl_profiles else None
+        if not new_profile_id and tpl_profiles:
+            new_profile_id = select_switch_profile_interactive_by_model(tpl_profiles, tpl_profile_map, sw['model'])
             if not new_profile_id:
                 continue
+
         try:
-            do_action(meraki_put, f"/devices/{sw['serial']}", data={"switchProfileId": new_profile_id})
+            # Assign the new profile
+            do_action(meraki_put, f"/devices/{serial}", data={"switchProfileId": new_profile_id})
             log_change(
                 'switch_profile_assign',
-                f"Assigned switchProfileId {new_profile_id} to {sw['serial']}",
-                device_serial=sw['serial'],
+                f"Assigned switchProfileId {new_profile_id} to {serial}",
+                device_serial=serial,
                 device_name=sw.get('name', ''),
                 misc=f"profile_name={old_profile_name or ''}"
             )
-            preserved = (sw.get('port_overrides') or {})
-            if preserved:
-                apply_port_overrides(sw['serial'], preserved)
-        except Exception:
-            logging.exception(f"Failed to assign profile to {sw['serial']}")
 
-    claimed = claim_devices(org_id, network_id, prevalidated_serials=prevalidated_serials)
+            # Give the device/API a brief moment to accept profile change
+            time.sleep(2)
+
+            # ✅ Prefer pre-bind snapshot overrides; fallback to post-bind computed diffs
+            preserved = prebind_overrides_by_serial.get(serial) or (sw.get('port_overrides') or {})
+            if preserved:
+                apply_port_overrides(serial, preserved)
+            else:
+                logging.debug("No port overrides to apply for %s", serial)
+
+        except Exception:
+            logging.exception("Failed to assign profile/apply overrides to %s", serial)
+
+
+    # --- wireless MR33 pre-check + hard guard ---
+    safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
+        org_id, network_id, prevalidated_serials
+    )
+    claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
     step_status['devices_claimed'] = bool(claimed)
 
-    # Choose orders for MR/MS and primary MX for naming after claim (auto if Enter/skip/cancel)
+    # Order / primary selection
     primary_mx_serial = select_primary_mx(org_id, claimed)
-    ensure_primary_mx(network_id, primary_mx_serial)  # ensure warm spare primary
+    ensure_primary_mx(network_id, primary_mx_serial)
     mr_order = select_device_order(org_id, claimed, 'MR')
     ms_order = select_device_order(org_id, claimed, 'MS')
 
+    # Compute deltas for rollback (after all device changes)
     post_change_devices = meraki_get(f"/networks/{network_id}/devices")
     post_change_serials = {d['serial'] for d in post_change_devices}
     claimed_serials = list(post_change_serials - pre_change_serials)
@@ -1679,12 +2038,14 @@ if __name__ == '__main__':
         new_mx, ms_list, mr_list = fetch_devices(org_id, network_id)
         step_status['old_mx'] = bool([d['serial'] for d in old_mx])
         step_status['old_mr33'] = bool([d['serial'] for d in old_mr if d['model'] == 'MR33'])
+
+        # Remove MX64 if newer MX was claimed
         try:
             mx_models = []
             for s in claimed:
                 try:
                     inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
-                    mx_models.append(inv.get('model', ''))
+                    mx_models.append(inv.get('model', '') or '')
                 except Exception:
                     pass
             if any(m.startswith('MX67') or m.startswith('MX75') for m in mx_models):
@@ -1692,25 +2053,34 @@ if __name__ == '__main__':
                 log_change('mx_removed', "Removed old MX64 after new MX claim", misc=f"claimed_serials={claimed}")
             step_status['mx_removed'] = True
         except Exception:
-            logging.exception("MX removal failed")
+            logging.exception("MX64 removal stage failed")
             step_status['mx_removed'] = False
+
+        # Remove legacy MR33 only if new wireless was claimed
         try:
-            mr33_ok = remove_existing_MR33_devices(org_id, network_id)
-            step_status['mr33_removed'] = mr33_ok
-            if mr33_ok:
-                log_change('mr33_removed', "Removed old MR33 after new AP claim", misc=f"claimed_serials={claimed}")
+            inv_models_claimed = _get_inventory_models_for_serials(org_id, claimed)
+            claimed_has_wireless = any(_is_wireless_model(m) for m in inv_models_claimed.values())
+            if claimed_has_wireless:
+                mr33_ok = remove_existing_MR33_devices(org_id, network_id)
+                step_status['mr33_removed'] = mr33_ok
+                if mr33_ok:
+                    log_change('mr33_removed', "Removed old MR33 after new AP claim", misc=f"claimed_serials={claimed}")
+            else:
+                step_status['mr33_removed'] = "NA"
         except Exception:
-            logging.exception("MR33 removal failed")
+            logging.exception("MR33 removal stage failed")
             step_status['mr33_removed'] = False
+
+        # Naming & configuration for claimed devices
         try:
             name_and_configure_claimed_devices(
-                org_id,
-                network_id,
-                network_name,
-                claimed,
-                ms_list,
-                mr_list,
-                tpl_profile_map,
+                org_id=org_id,
+                network_id=network_id,
+                network_name=network_name,
+                serials=claimed,
+                ms_list=ms_list,
+                mr_list=mr_list,
+                tpl_profile_map=tpl_profile_map,
                 old_mx_devices=old_mx,
                 old_mr_devices=old_mr,
                 primary_mx_serial=primary_mx_serial,
@@ -1731,18 +2101,42 @@ if __name__ == '__main__':
 
     print_summary(step_status)
 
+    # --- Export POST snapshot ---
+    final_mx, final_ms, final_mr = fetch_devices(org_id, network_id, template_id=new_template)
+    final_vlans = fetch_vlan_details(network_id)
+    final_tpl_id = meraki_get(f"/networks/{network_id}").get('configTemplateId')
+    final_profileid_to_name: Dict[str, str] = {}
+    if final_tpl_id:
+        try:
+            final_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{final_tpl_id}/switch/profiles") or []
+            final_profileid_to_name = {p['switchProfileId']: p['name'] for p in final_profiles}
+        except Exception:
+            logging.exception("Failed fetching final template switch profiles")
+
+    export_network_snapshot_xlsx(
+        org_id=org_id,
+        network_id=network_id,
+        network_name=network_name,
+        template_id=final_tpl_id,
+        vlan_list=final_vlans,
+        mx_list=final_mx,
+        ms_list=final_ms,
+        mr_list=final_mr,
+        profileid_to_name=final_profileid_to_name,
+        outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_post_{timestamp}.xlsx",
+    )
+
     # -------- Enhanced rollback prompt --------
     rollback_choice = prompt_rollback_big()
-
     if rollback_choice in {'yes', 'y'}:
         print("\nRolling back all changes...")
         log_change('rollback_start', 'User requested rollback')
         rollback_all_changes(
-            network_id,
-            pre_change_devices,
-            pre_change_vlans,
-            pre_change_template,
-            org_id,
+            network_id=network_id,
+            pre_change_devices=pre_change_devices,
+            pre_change_vlans=pre_change_vlans,
+            pre_change_template=pre_change_template,
+            org_id=org_id,
             claimed_serials=claimed_serials,
             removed_serials=removed_serials,
             ms_list=ms,
@@ -1750,11 +2144,9 @@ if __name__ == '__main__':
         )
         print("✅ Rollback complete.")
         log_change('rollback_end', 'Rollback completed')
-
     elif rollback_choice in {'no', 'n'}:
         print("\nProceeding without rollback. Rollback option will no longer be available.")
         log_change('workflow_end', 'Script finished (no rollback)')
-
     else:
         print("\n❌ No rollback selected (Enter pressed).")
         print("⚠️  Rollback is no longer available. Please ensure the network is functional and all required checks have been carried out.")
