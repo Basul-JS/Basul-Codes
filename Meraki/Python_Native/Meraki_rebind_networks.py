@@ -2100,32 +2100,7 @@ if __name__ == '__main__':
         step_status.setdefault('old_mr33', "NA")
 
     print_summary(step_status)
-
-    # --- Export POST snapshot ---
-    final_mx, final_ms, final_mr = fetch_devices(org_id, network_id, template_id=new_template)
-    final_vlans = fetch_vlan_details(network_id)
-    final_tpl_id = meraki_get(f"/networks/{network_id}").get('configTemplateId')
-    final_profileid_to_name: Dict[str, str] = {}
-    if final_tpl_id:
-        try:
-            final_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{final_tpl_id}/switch/profiles") or []
-            final_profileid_to_name = {p['switchProfileId']: p['name'] for p in final_profiles}
-        except Exception:
-            logging.exception("Failed fetching final template switch profiles")
-
-    export_network_snapshot_xlsx(
-        org_id=org_id,
-        network_id=network_id,
-        network_name=network_name,
-        template_id=final_tpl_id,
-        vlan_list=final_vlans,
-        mx_list=final_mx,
-        ms_list=final_ms,
-        mr_list=final_mr,
-        profileid_to_name=final_profileid_to_name,
-        outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_post_{timestamp}.xlsx",
-    )
-
+    
     # -------- Enhanced rollback prompt --------
     rollback_choice = prompt_rollback_big()
     if rollback_choice in {'yes', 'y'}:
