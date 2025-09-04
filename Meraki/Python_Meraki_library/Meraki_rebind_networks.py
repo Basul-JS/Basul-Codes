@@ -1649,6 +1649,43 @@ def export_network_snapshot_xlsx(
     print(f"📄 Snapshot exported to Excel: {out_path}")
     log_change("snapshot_export", f"Exported network snapshot to {out_path}", network_id=network_id, network_name=network_name)
 
+def export_post_change_snapshot(org_id: str, network_id: str, network_name: str) -> None:
+    """
+    Export a post-change snapshot using export_network_snapshot_xlsx().
+    File name will include '_POST' so it's easy to compare with the pre-change file.
+    """
+    try:
+        net = dashboard.networks.getNetwork(network_id)
+        current_template = net.get('configTemplateId')
+    except Exception:
+        logging.exception("Failed to read current template for post-change snapshot")
+        current_template = None
+
+    # Re-fetch live state after changes
+    mx_list, ms_list, mr_list = fetch_devices(org_id, network_id, template_id=current_template)
+    vlan_list = fetch_vlan_details(network_id)
+    profileid_to_name = get_profileid_to_name(org_id, current_template)
+
+    # Make a post-change filename (re-use timestamp so it's paired with the pre file)
+    base = _network_number_from_name(network_name) or _network_tag_from_name(network_name)
+    outfile = f"{_slug_filename(base)}_{timestamp}_POST.xlsx"
+
+    export_network_snapshot_xlsx(
+        org_id=org_id,
+        network_id=network_id,
+        network_name=network_name,
+        template_id=current_template,
+        vlan_list=vlan_list,
+        mx_list=mx_list,
+        ms_list=ms_list,
+        mr_list=mr_list,
+        profileid_to_name=profileid_to_name,
+        outfile=outfile,          # <-- explicit post filename
+        filename_mode="name",
+    )
+    log_change("snapshot_export_post", f"Exported post-change snapshot to {outfile}",
+               network_id=network_id, network_name=network_name)
+
 # ------------- Selectors (org/network) -------------
 def select_network_interactive(org_id: str) -> Tuple[str, str]:
     while True:
@@ -1863,15 +1900,20 @@ if __name__ == '__main__':
             step_status=step_status,
         )
 
+        # Export a post-change snapshot for comparison
+        export_post_change_snapshot(org_id, network_id, network_name)
+
         # Compute deltas for rollback option
         post_change_devices = dashboard.networks.getNetworkDevices(network_id)
         post_change_serials = {d['serial'] for d in post_change_devices}
         claimed_serials_rb = list(post_change_serials - pre_change_serials)
         removed_serials_rb = list(pre_change_serials - post_change_serials)
-
+        
         print_summary(step_status)
-
+        
+        
         rollback_choice = prompt_rollback_big()
+
 
         if rollback_choice in {'yes', 'y'}:
             print("\nRolling back all changes...")
@@ -2039,6 +2081,9 @@ if __name__ == '__main__':
         step_status.setdefault('configured', "NA")
         step_status.setdefault('old_mx', "NA")
         step_status.setdefault('old_mr33', "NA")
+
+    # Export a post-change snapshot for comparison
+    export_post_change_snapshot(org_id, network_id, network_name)
 
     print_summary(step_status)
 
