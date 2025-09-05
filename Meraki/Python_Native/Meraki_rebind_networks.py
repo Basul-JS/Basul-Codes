@@ -1,6 +1,7 @@
 # Created by JS 
 # uses the native python library to rebind a meraki network to a new template 
     # allows the claiming and addining of new devices to the network replacing old devices / models
+# 20250905 - updated to enable WAN2 on the new MX's
 
 
 import requests
@@ -1038,6 +1039,79 @@ def name_and_configure_claimed_devices(
         except Exception:
             logging.exception(f"Failed configuring {s} (MS)")
 
+def enable_mx_wan2(serial: str) -> bool:
+    """
+    Enables WAN2 for the given MX by updating /devices/{serial}/appliance/uplinks/settings.
+    Preserves existing settings by GET->merge->PUT. Falls back to minimal payload if needed.
+    """
+    path = f"/devices/{serial}/appliance/uplinks/settings"
+
+    # Try to preserve existing settings
+    existing: Dict[str, Any] | None = None
+    try:
+        existing = meraki_get(path)  # may be dict or 404 for non-MX
+    except MerakiAPIError as e:
+        # Non-MX or endpoint not available yet—just proceed with minimal payload
+        if e.status_code not in (400, 404):
+            logging.debug("GET uplink settings for %s returned %s, proceeding with minimal payload", serial, e.status_code)
+
+    # Build payload
+    payload: Dict[str, Any]
+    if isinstance(existing, dict):
+        merged = dict(existing)
+        wan2 = dict(merged.get("wan2", {}))
+        wan2["enabled"] = True
+        merged["wan2"] = wan2
+        payload = merged
+    else:
+        payload = {"wan2": {"enabled": True}}
+
+    # PUT (best effort)
+    try:
+        do_action(meraki_put, path, data=payload)
+        log_change(
+            "mx_wan2_enable",
+            "Enabled WAN2 on MX",
+            device_serial=serial,
+            misc=json.dumps({"payload": payload})
+        )
+        logging.info("Enabled WAN2 for %s", serial)
+        return True
+    except MerakiAPIError as e:
+        # Fallback: try minimal payload if merge failed
+        try:
+            do_action(meraki_put, path, data={"wan2": {"enabled": True}})
+            log_change(
+                "mx_wan2_enable",
+                "Enabled WAN2 on MX (fallback payload)",
+                device_serial=serial,
+                misc='{"wan2":{"enabled":true}}'
+            )
+            logging.info("Enabled WAN2 (fallback) for %s", serial)
+            return True
+        except Exception:
+            logging.error("Failed enabling WAN2 for %s: %s %s", serial, e.status_code, e.text)
+            return False
+    except Exception:
+        logging.exception("Unexpected error enabling WAN2 for %s", serial)
+        return False
+
+
+def enable_wan2_on_claimed_mx(org_id: str, claimed_serials: List[str]) -> None:
+    """
+    Loops over newly claimed serials and enables WAN2 only on MX models.
+    """
+    for s in claimed_serials:
+        try:
+            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
+            model = (inv.get("model") or "").upper()
+            if model.startswith("MX"):
+                ok = enable_mx_wan2(s)
+                if not ok:
+                    logging.warning("WAN2 not enabled for %s (model %s)", s, model)
+        except Exception:
+            logging.exception("Could not evaluate/enable WAN2 for %s", s)
+
 def remove_recently_added_tag(network_id: str):
     devs = meraki_get(f"/networks/{network_id}/devices")
     for d in devs:
@@ -1786,6 +1860,14 @@ if __name__ == '__main__':
 
         step_status['devices_claimed'] = bool(claimed)
 
+        # Enable WAN2 on newly added MX
+        try:
+            if claimed:
+                enable_wan2_on_claimed_mx(org_id, claimed)
+        except Exception:
+            logging.exception("Failed enabling WAN2 on claimed MX devices")
+
+
         # Order / primary selection
         primary_mx_serial = select_primary_mx(org_id, claimed)
         ensure_primary_mx(network_id, primary_mx_serial)
@@ -2021,6 +2103,14 @@ if __name__ == '__main__':
     )
     claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
     step_status['devices_claimed'] = bool(claimed)
+
+    # Enable WAN2 on newly added MX
+    try:
+        if claimed:
+                enable_wan2_on_claimed_mx(org_id, claimed)
+    except Exception:
+        logging.exception("Failed enabling WAN2 on claimed MX devices")
+
 
     # Order / primary selection
     primary_mx_serial = select_primary_mx(org_id, claimed)
