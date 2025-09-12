@@ -836,31 +836,12 @@ def name_and_configure_claimed_devices(
     if ms_order:
         ms_serials = [s for s in ms_order if s in ms_serials]
 
-    # MX
-    # mx_idx = 0
-    # for s in mx_serials:
-    #     mdl = (inv_by_serial.get(s, {}).get('model') or '')
-    #     data: Dict[str, Any] = {}
-    #     data['name'] = f"{prefix}-mx-{counts['MX']:02}"
-    #     if mx_idx < len(old_mxs_sorted):
-    #         data['address'] = old_mxs_sorted[mx_idx].get('address', '')
-    #         data['tags'] = old_mxs_sorted[mx_idx].get('tags', [])
-    #     else:
-    #         data['address'] = ''
-    #         data['tags'] = []
-    #     mx_idx += 1
-    #     counts['MX'] += 1
-    #     try:
-    #         do_action(dashboard.devices.updateDevice, s, **data)
-    #         log_change('device_update', f"Renamed and reconfigured device {s} ({mdl})",
-    #                    device_serial=s, device_name=data.get('name', ''),
-    #                    misc=f"tags={data.get('tags', [])}, address={data.get('address', '')}")
-    #     except Exception:
-    #         logging.exception(f"Failed configuring {s} (MX)")
-        # MX
+# MX
     mx_idx = 0
     for s in mx_serials:
         mdl = (inv_by_serial.get(s, {}).get('model') or '')
+        mdl_upper = mdl.upper()
+
         data: Dict[str, Any] = {}
         data['name'] = f"{prefix}-mx-{counts['MX']:02}"
         if mx_idx < len(old_mxs_sorted):
@@ -872,34 +853,36 @@ def name_and_configure_claimed_devices(
         mx_idx += 1
         counts['MX'] += 1
 
-        # Rename / re-tag first (as you already did)
+    # Rename / re-tag first (as you already did)
         try:
             do_action(dashboard.devices.updateDevice, s, **data)
             log_change('device_update', f"Renamed and reconfigured device {s} ({mdl})",
-                       device_serial=s, device_name=data.get('name', ''),
-                       misc=f"tags={data.get('tags', [])}, address={data.get('address', '')}")
+                   device_serial=s, device_name=data.get('name', ''),
+                   misc=f"tags={data.get('tags', [])}, address={data.get('address', '')}")
         except Exception:
             logging.exception(f"Failed configuring {s} (MX)")
 
-        # NEW: Enable WAN2 on the MX uplinks
-        try:
-            do_action(
+    # Enable WAN2 ONLY on MX67 models
+        if mdl_upper.startswith('MX67'):
+            try:
+                do_action(
                 dashboard.appliance.updateDeviceApplianceUplinksSettings,
                 s,
                 interfaces={"wan2": {"enabled": True}}
-            )
-            log_change(
+                )
+                log_change(
                 'mx_wan2_enable',
-                'Enabled WAN2 on MX',
+                'Enabled WAN2 on MX67',
                 device_serial=s,
                 device_name=data.get('name', ''),
                 misc='interfaces={"wan2":{"enabled":true}}'
             )
-        except Exception:
-            # Some models (or licensing/mode) may not support WAN2 or the call could fail; we just log.
-            logging.exception(f"Failed to enable WAN2 uplink on {s}")
-
-
+            except Exception:
+                logging.exception(f"Failed to enable WAN2 uplink on {s}")
+        else:
+            logging.debug("Skipped WAN2 enable for non-MX67 %s (%s)", s, mdl)
+# MX
+    
     # MR
     ap_idx = 0
     for s in mr_serials:
