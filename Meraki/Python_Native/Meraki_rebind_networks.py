@@ -1096,21 +1096,26 @@ def enable_mx_wan2(serial: str) -> bool:
         logging.exception("Unexpected error enabling WAN2 for %s", serial)
         return False
 
-
 def enable_wan2_on_claimed_mx(org_id: str, claimed_serials: List[str]) -> None:
     """
-    Loops over newly claimed serials and enables WAN2 only on MX models.
+    Enable WAN2 only on newly claimed MX67 devices.
+    (No-op for other MX models or non-MX devices.)
     """
     for s in claimed_serials:
         try:
             inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}")
             model = (inv.get("model") or "").upper()
-            if model.startswith("MX"):
+            if model.startswith("MX67"):
                 ok = enable_mx_wan2(s)
                 if not ok:
                     logging.warning("WAN2 not enabled for %s (model %s)", s, model)
+            else:
+                logging.info("Skipping WAN2 enable for %s (model %s is not MX67)", s, model or "unknown")
+        except MerakiAPIError as e:
+            logging.exception("Inventory check failed for %s: %s %s", s, e.status_code, e.text)
         except Exception:
             logging.exception("Could not evaluate/enable WAN2 for %s", s)
+
 
 def remove_recently_added_tag(network_id: str):
     devs = meraki_get(f"/networks/{network_id}/devices")
