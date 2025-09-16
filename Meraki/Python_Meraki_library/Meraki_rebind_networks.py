@@ -5,6 +5,11 @@
 # 20250916 - updated to remove the block on MR33's been added
     # updated name of excel eports to correctly reference  pre and post 
     # removed redundant code
+# 20250916 - Port override logic updated
+# Python Dependencies
+    # pip install meraki 
+    # pip install openpyxl
+
 
 import meraki
 import logging
@@ -1680,6 +1685,40 @@ def export_network_snapshot_xlsx(
     print(f"📄 Snapshot exported to Excel: {out_path}")
     log_change("snapshot_export", f"Exported network snapshot to {out_path}", network_id=network_id, network_name=network_name)
 
+def _sanitize_port_patch_for_new_template(patch: Dict[str, Any]) -> Dict[str, Any]:
+    """On error, remove/adjust fields that are commonly non-portable across templates."""
+    cleaned = dict(patch)
+    # These often break after rebind; remove them if they cause 4xx
+    for k in ('portScheduleId',):
+        cleaned.pop(k, None)
+    # If access policy mismatches, fall back to open
+    if cleaned.get('accessPolicyType') or cleaned.get('accessPolicyNumber') is not None:
+        cleaned.pop('accessPolicyNumber', None)
+        cleaned['accessPolicyType'] = 'Open'
+    return cleaned
+
+def apply_port_overrides_with_retry(serial: str, overrides: Dict[str, Dict[str, Any]], retries: int = 5, delay: int = 3) -> None:
+    for pid, patch in (overrides or {}).items():
+        attempt = 0
+        sanitized_once = False
+        while True:
+            try:
+                do_action(dashboard.switch.updateDeviceSwitchPort, serial, pid, **patch)
+                log_change('switch_port_override', f"Applied port overrides on port {pid}",
+                           device_serial=serial, misc=json.dumps(patch))
+                break
+            except Exception as e:
+                attempt += 1
+                # Try one sanitation pass if we hit a 4xx-style error
+                if not sanitized_once:
+                    patch = _sanitize_port_patch_for_new_template(patch)
+                    sanitized_once = True
+                if attempt >= retries:
+                    logging.exception(f"Failed applying port overrides on {serial} port {pid} after {retries} tries: {e}")
+                    break
+                logging.debug(f"Retrying {serial} port {pid} in {delay}s due to: {e}")
+                time.sleep(delay)
+
 def export_post_change_snapshot(org_id: str, network_id: str, network_name: str) -> None:
     """
     Export a post-change snapshot using export_network_snapshot_xlsx().
@@ -1980,6 +2019,12 @@ if __name__ == '__main__':
     old_mx, prebind_ms_devices, old_mr = fetch_devices(org_id, network_id, template_id=old_template)
     ms_serial_to_profileid = {sw['serial']: sw.get('switchProfileId') for sw in prebind_ms_devices}
 
+    # After: old_mx, prebind_ms_devices, old_mr = fetch_devices(org_id, network_id, template_id=old_template)
+    prebind_overrides_by_serial = {
+        sw['serial']: (sw.get('port_overrides') or {})
+        for sw in prebind_ms_devices
+    }
+
     if old_template:
         try:
             old_tpl_profiles = dashboard.switch.getOrganizationConfigTemplateSwitchProfiles(org_id, old_template)
@@ -2055,21 +2100,22 @@ if __name__ == '__main__':
             new_profile_id = select_switch_profile_interactive_by_model(tpl_profiles, tpl_profile_map, sw['model']) if tpl_profiles else None
             if not new_profile_id:
                 continue
+     # After computing prebind_overrides_by_serial earlier
+
         try:
             do_action(dashboard.devices.updateDevice, sw['serial'], switchProfileId=new_profile_id)
-            log_change(
-                'switch_profile_assign',
-                f"Assigned switchProfileId {new_profile_id} to {sw['serial']}",
-                device_serial=sw['serial'],
-                device_name=sw.get('name', ''),
-                misc=f"profile_name={old_profile_name or ''}"
-            )
-            preserved = (sw.get('port_overrides') or {})
-            if preserved:
-                apply_port_overrides(sw['serial'], preserved)
-        except Exception:
-            logging.exception(f"Failed to assign profile to {sw['serial']}")
+            log_change('switch_profile_assign', f"Assigned switchProfileId {new_profile_id} to {sw['serial']}",
+                    device_serial=sw['serial'], device_name=sw.get('name', ''),
+                    misc=f"profile_name={old_profile_name or ''}")
 
+            time.sleep(3)  # let profile settle
+
+            preserved = prebind_overrides_by_serial.get(sw['serial'], {})
+            if preserved:
+                apply_port_overrides_with_retry(sw['serial'], preserved, retries=5, delay=3)
+        except Exception:
+            logging.exception(f"Failed to assign profile / apply overrides to {sw['serial']}")
+  
     # --- wireless MR33 pre-check (prompts for non-MR33 removals) ---
     safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
         org_id, network_id, prevalidated_serials
