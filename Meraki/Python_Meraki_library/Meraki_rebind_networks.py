@@ -2,6 +2,9 @@
 # Rebinds network to a New Template
 # 20250903 - updated with new logic for MR33 presence
 # 20250905 - updated to enable WAN2 on the new MX's
+# 20250916 - updated to remove the block on MR33's been added
+    # updated name of excel eports to correctly reference  pre and post 
+    # removed redundant code
 
 import meraki
 import logging
@@ -1404,33 +1407,35 @@ def run_wireless_precheck_and_filter_claims(
     prevalidated_serials: List[str],
 ) -> Tuple[List[str], List[str], List[str]]:
     """
-    Runs ensure_mr33_and_handle_wireless_replacements(), handles exceptions safely,
-    and returns a version of serials that excludes *all* wireless models and anything
-    the helper already claimed. This guarantees claim_devices() won't claim wireless.
+    Run the MR33 pre-check/replacement flow.
+
+    Behavior:
+      - If there are non-MR33 APs present, the helper will PROMPT the user about replacements.
+      - It may remove old APs and claim mapped new ones (with confirmation).
+      - It returns serials to claim next, with ONLY those already claimed in this function removed.
+        (No blanket wireless filtering — wireless proceeds automatically.)
 
     Returns:
         safe_to_claim, mr_removed_serials, mr_claimed_serials
     """
-    # Always defined for Pylance/myPy even if try/except path hits the except.
     mr_removed_serials: List[str] = []
     mr_claimed_serials: List[str] = []
 
     try:
-        prevalidated_serials, mr_removed_serials, mr_claimed_serials = ensure_mr33_and_handle_wireless_replacements(
+        updated_serials, mr_removed_serials, mr_claimed_serials = ensure_mr33_and_handle_wireless_replacements(
             org_id, network_id, prevalidated_serials
         )
     except SystemExit:
         raise
     except Exception:
         logging.exception("Wireless pre-check/replacement step failed")
+        updated_serials = prevalidated_serials  # fall back
 
-    # Hard guard: block any remaining wireless and any we just claimed in the helper.
-    _inv_models = _get_inventory_models_for_serials(org_id, prevalidated_serials)
-    _wireless_serials = {s for s, m in _inv_models.items() if _is_wireless_model(m)}
-    _do_not_claim = _wireless_serials | set(mr_claimed_serials)
-    safe_to_claim = [s for s in prevalidated_serials if s not in _do_not_claim]
-
+    # IMPORTANT: Do NOT filter out wireless here.
+    # Only avoid double-claiming anything already claimed in the helper.
+    safe_to_claim = [s for s in updated_serials if s not in set(mr_claimed_serials)]
     return safe_to_claim, mr_removed_serials, mr_claimed_serials
+
 
 def cleanup_after_claims(
     org_id: str,
@@ -1575,7 +1580,7 @@ def export_network_snapshot_xlsx(
             base = _network_number_from_name(network_name) or _network_tag_from_name(network_name)
         else:  # "name"
             base = _network_tag_from_name(network_name)
-        out_path = f"{_slug_filename(base)}_{timestamp}.xlsx"
+        out_path = f"{_slug_filename(_network_tag_from_name(network_name))}_pre_{timestamp}.xlsx"
         
     wb: Workbook = Workbook()
     ws: Worksheet = cast(Worksheet, wb.active)
@@ -1678,7 +1683,7 @@ def export_network_snapshot_xlsx(
 def export_post_change_snapshot(org_id: str, network_id: str, network_name: str) -> None:
     """
     Export a post-change snapshot using export_network_snapshot_xlsx().
-    File name will include '_POST' so it's easy to compare with the pre-change file.
+    File name will follow: <tag>_post_<timestamp>.xlsx
     """
     try:
         net = dashboard.networks.getNetwork(network_id)
@@ -1692,9 +1697,7 @@ def export_post_change_snapshot(org_id: str, network_id: str, network_name: str)
     vlan_list = fetch_vlan_details(network_id)
     profileid_to_name = get_profileid_to_name(org_id, current_template)
 
-    # Make a post-change filename (re-use timestamp so it's paired with the pre file)
-    base = _network_number_from_name(network_name) or _network_tag_from_name(network_name)
-    outfile = f"{_slug_filename(base)}_{timestamp}_POST.xlsx"
+    outfile = f"{_slug_filename(_network_tag_from_name(network_name))}_post_{timestamp}.xlsx"
 
     export_network_snapshot_xlsx(
         org_id=org_id,
@@ -1706,8 +1709,7 @@ def export_post_change_snapshot(org_id: str, network_id: str, network_name: str)
         ms_list=ms_list,
         mr_list=mr_list,
         profileid_to_name=profileid_to_name,
-        outfile=outfile,          # <-- explicit post filename
-        filename_mode="name",
+        outfile=outfile,
     )
     log_change("snapshot_export_post", f"Exported post-change snapshot to {outfile}",
                network_id=network_id, network_name=network_name)
@@ -1849,6 +1851,7 @@ if __name__ == '__main__':
     pre_change_serials = {d['serial'] for d in pre_change_devices}
     profileid_to_name = get_profileid_to_name(org_id, old_template)
 
+    # Export PRE snapshot with new filename format
     export_network_snapshot_xlsx(
         org_id=org_id,
         network_id=network_id,
@@ -1858,7 +1861,8 @@ if __name__ == '__main__':
         mx_list=mx,
         ms_list=ms,
         mr_list=mr,
-        profileid_to_name=profileid_to_name
+        profileid_to_name=profileid_to_name,
+        outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_pre_{timestamp}.xlsx",
     )
 
     current_mx_models = sorted({d['model'] for d in mx})
@@ -1883,10 +1887,12 @@ if __name__ == '__main__':
         step_status['vlans_updated'] = "NA"
         step_status['mx_removed'] = "NA"
 
-        # --- wireless MR33 pre-check + hard guard (factored) ---
+        # --- wireless MR33 pre-check (prompts for non-MR33 removals) ---
         safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
             org_id, network_id, prevalidated_serials
         )
+
+        # Claim remaining devices (wireless included), excluding those already claimed in helper
         claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
         step_status['devices_claimed'] = bool(claimed)
 
@@ -1896,7 +1902,7 @@ if __name__ == '__main__':
         mr_order = select_device_order(org_id, claimed, 'MR')
         ms_order = select_device_order(org_id, claimed, 'MS')
 
-        # Fetch template profiles (if any) for post-claim config
+        # Template profiles (if any) for post-claim config
         try:
             if old_template:
                 tpl_profiles = dashboard.switch.getOrganizationConfigTemplateSwitchProfiles(org_id, old_template)
@@ -1909,7 +1915,7 @@ if __name__ == '__main__':
             tpl_profile_map = {}
             tpl_profiles = []
 
-        # Unified cleanup/config
+        # Unified cleanup/config (also handles MX64/MR33 removals and naming)
         cleanup_after_claims(
             org_id,
             network_id,
@@ -1926,20 +1932,18 @@ if __name__ == '__main__':
             step_status=step_status,
         )
 
-        # Export a post-change snapshot for comparison
+        # Export POST snapshot
         export_post_change_snapshot(org_id, network_id, network_name)
 
-        # Compute deltas for rollback option
+        # Deltas for rollback option
         post_change_devices = dashboard.networks.getNetworkDevices(network_id)
         post_change_serials = {d['serial'] for d in post_change_devices}
         claimed_serials_rb = list(post_change_serials - pre_change_serials)
         removed_serials_rb = list(pre_change_serials - post_change_serials)
-        
-        print_summary(step_status)
-        
-        
-        rollback_choice = prompt_rollback_big()
 
+        print_summary(step_status)
+
+        rollback_choice = prompt_rollback_big()
 
         if rollback_choice in {'yes', 'y'}:
             print("\nRolling back all changes...")
@@ -2066,10 +2070,12 @@ if __name__ == '__main__':
         except Exception:
             logging.exception(f"Failed to assign profile to {sw['serial']}")
 
-    # --- wireless MR33 pre-check + hard guard (factored) ---
+    # --- wireless MR33 pre-check (prompts for non-MR33 removals) ---
     safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
         org_id, network_id, prevalidated_serials
     )
+
+    # Claim remaining devices (wireless included), excluding those already claimed in helper
     claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
     step_status['devices_claimed'] = bool(claimed)
 
@@ -2095,21 +2101,20 @@ if __name__ == '__main__':
             old_mx_devices=old_mx,      # from pre-bind snapshot
             old_mr_devices=old_mr,      # from pre-bind snapshot
             tpl_profile_map=tpl_profile_map,
-            # Let helper refresh ms/mr lists as needed
             primary_mx_serial=primary_mx_serial,
             mr_order=mr_order,
             ms_order=ms_order,
             step_status=step_status,
         )
+
+        # Export POST snapshot
+        export_post_change_snapshot(org_id, network_id, network_name)
     else:
         step_status.setdefault('mx_removed', "NA")
         step_status.setdefault('mr33_removed', "NA")
         step_status.setdefault('configured', "NA")
         step_status.setdefault('old_mx', "NA")
         step_status.setdefault('old_mr33', "NA")
-
-    # Export a post-change snapshot for comparison
-    export_post_change_snapshot(org_id, network_id, network_name)
 
     print_summary(step_status)
 
