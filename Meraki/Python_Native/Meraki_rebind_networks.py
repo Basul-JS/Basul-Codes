@@ -220,38 +220,11 @@ def do_action(func, *args, **kwargs):
         return None
     return func(*args, **kwargs)
 
-# ======================================================
-# ------------- Wireless pre-check helpers -------------
-# ======================================================
-from typing import Optional, List, Dict, Any, Tuple, Set
+# # ======================================================
+# # ------------- Wireless pre-check helpers -------------
+# # ======================================================
 
 WIRELESS_PREFIXES: Tuple[str, ...] = ("MR", "CW")
-
-def _is_wireless_model(model: Optional[str]) -> bool:
-    return bool(model) and model.upper().startswith(WIRELESS_PREFIXES)
-
-def _is_mr33(model: Optional[str]) -> bool:
-    return bool(model) and model.upper().startswith("MR33")
-
-def _get_network_wireless_devices(network_id: str) -> List[Dict[str, Any]]:
-    try:
-        devices: List[Dict[str, Any]] = meraki_get(f"/networks/{network_id}/devices") or []
-    except Exception:
-        logging.exception("Failed to list devices for wireless check")
-        return []
-    return [d for d in devices if _is_wireless_model(d.get("model"))]
-
-def _get_inventory_models_for_serials(org_id: str, serials: List[str]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for s in serials:
-        try:
-            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}") or {}
-            mdl = inv.get("model")
-            if mdl:
-                out[s] = mdl
-        except Exception:
-            logging.exception("Inventory lookup failed for %s", s)
-    return out
 
 def _prompt_yes_no(question: str, default_no: bool = True) -> bool:
     prompt = " [y/N] " if default_no else " [Y/n] "
@@ -295,65 +268,6 @@ def _prompt_replacement_mapping(old_serials: List[str], new_serials: List[str]) 
         available_new.remove(new_s.upper())
     return mapping
 
-def ensure_mr33_and_handle_wireless_replacements(
-    org_id: str,
-    network_id: str,
-    serials_to_add: List[str],
-) -> Tuple[List[str], List[str], List[str]]:
-    """
-    If incoming list contains wireless, ensure there is/was an MR33 in the network or incoming.
-    Optionally replace non-MR33 wireless already in the network with incoming wireless units.
-    Returns: (serials_to_add_excluding_already_claimed_wireless, removed_old_wireless, claimed_new_wireless)
-    """
-    add_models: Dict[str, str] = _get_inventory_models_for_serials(org_id, serials_to_add)
-    incoming_wireless: List[str] = [s for s, m in add_models.items() if _is_wireless_model(m)]
-    if not incoming_wireless:
-        return serials_to_add, [], []
-
-    wireless_now = _get_network_wireless_devices(network_id)
-    has_mr33_now = any(_is_mr33(d.get("model")) for d in wireless_now)
-    non_mr33_in_net = [
-        d for d in wireless_now if _is_wireless_model(d.get("model")) and not _is_mr33(d.get("model"))
-    ]
-    adding_has_mr33 = any(_is_mr33(add_models.get(s)) for s in incoming_wireless)
-
-    if not has_mr33_now and not adding_has_mr33:
-        if not _prompt_yes_no("No MR33 detected in network or incoming. Proceed anyway?", default_no=True):
-            print("Aborting per user input (no MR33).")
-            raise SystemExit(1)
-
-    removed_old: List[str] = []
-    claimed_new: List[str] = []
-
-    if non_mr33_in_net and _prompt_yes_no("Replace non-MR33 wireless with incoming?", default_no=False):
-        mapping = _prompt_replacement_mapping(
-            [str(d.get("serial")) for d in non_mr33_in_net if d.get("serial")],
-            incoming_wireless
-        )
-        for old_serial, new_serial in mapping:
-            try:
-                # Clear metadata, then remove from network
-                do_action(meraki_put, f"/devices/{old_serial}", data={"name": "", "address": ""})
-                do_action(meraki_post, f"/networks/{network_id}/devices/remove", data={"serial": old_serial})
-                log_change('wireless_replace_remove', f"Removed old wireless {old_serial}", device_serial=old_serial)
-                removed_old.append(old_serial)
-            except Exception:
-                logging.exception("Failed to remove %s", old_serial)
-
-            try:
-                # Claim the replacement
-                do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": [new_serial]})
-                log_change('wireless_replace_claim', f"Claimed new wireless {new_serial}", device_serial=new_serial)
-                claimed_new.append(new_serial)
-            except Exception:
-                logging.exception("Failed to claim %s", new_serial)
-
-    # Exclude any wireless we just claimed from the still-to-claim list
-    claimed_new_set: Set[str] = set(claimed_new)
-    serials_to_add_remaining = [s for s in serials_to_add if s not in claimed_new_set]
-
-    return serials_to_add_remaining, removed_old, claimed_new
-
 def run_wireless_precheck_and_filter_claims(
     org_id: str,
     network_id: str,
@@ -390,6 +304,102 @@ def run_wireless_precheck_and_filter_claims(
     safe_to_claim = [s for s in prevalidated_serials if s not in do_not_claim]
 
     return safe_to_claim, mr_removed_serials, mr_claimed_serials
+
+def _is_wireless_model(model: Optional[str]) -> bool:
+    return bool(model) and model.upper().startswith(WIRELESS_PREFIXES)
+
+def _is_mr33(model: Optional[str]) -> bool:
+    return bool(model) and model.upper().startswith("MR33")
+
+def _get_network_wireless_devices(network_id: str) -> List[Dict[str, Any]]:
+    try:
+        devices: List[Dict[str, Any]] = meraki_get(f"/networks/{network_id}/devices") or []
+    except Exception:
+        logging.exception("Failed to list devices for wireless check")
+        return []
+    return [d for d in devices if _is_wireless_model(cast(Optional[str], d.get("model")))]
+
+def _get_inventory_models_for_serials(org_id: str, serials: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for s in serials:
+        try:
+            inv = meraki_get(f"/organizations/{org_id}/inventoryDevices/{s}") or {}
+            mdl = cast(Optional[str], inv.get("model"))
+            if mdl:
+                out[s] = mdl
+        except Exception:
+            logging.exception("Inventory lookup failed for %s", s)
+    return out
+
+def ensure_mr33_and_handle_wireless_replacements(
+    org_id: str,
+    network_id: str,
+    serials_to_add: List[str],
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Returns:
+        (serials_safe_to_claim, removed_old_wireless, claimed_new_wireless)
+
+    If operator says "No" to the MR33 presence prompt, we DO NOT exit:
+    we skip all wireless changes by filtering wireless serials out of the claim list.
+    """
+    add_models: Dict[str, str] = _get_inventory_models_for_serials(org_id, serials_to_add)
+    incoming_wireless: List[str] = [s for s, m in add_models.items() if _is_wireless_model(m)]
+    if not incoming_wireless:
+        return serials_to_add, [], []
+
+    wireless_now: List[Dict[str, Any]] = _get_network_wireless_devices(network_id)
+    has_mr33_now: bool = any(_is_mr33(cast(Optional[str], d.get("model"))) for d in wireless_now)
+
+    adding_has_mr33: bool = any(_is_mr33(add_models.get(s)) for s in incoming_wireless)
+
+    # If no MR33 in network and none incoming -> ask, but do NOT exit on "No".
+    if not has_mr33_now and not adding_has_mr33:
+        proceed = _prompt_yes_no("No MR33 detected in network or incoming. Proceed with wireless changes?", default_no=True)
+        if not proceed:
+            print("Skipping wireless add/remove per operator choice; continuing with the rest of the workflow.")
+            log_change('wireless_skip', "Operator chose to skip wireless changes due to no MR33 present")
+            # Filter out ALL wireless from the claim list; no add/remove on wireless
+            non_wireless = [s for s in serials_to_add if s not in incoming_wireless]
+            return non_wireless, [], []
+
+    # Otherwise, optionally offer replacement of non-MR33 wireless
+    non_mr33_in_net: List[Dict[str, Any]] = [
+        d for d in wireless_now
+        if _is_wireless_model(cast(Optional[str], d.get("model"))) and not _is_mr33(cast(Optional[str], d.get("model")))
+    ]
+
+    removed_old: List[str] = []
+    claimed_new: List[str] = []
+
+    if non_mr33_in_net and _prompt_yes_no("Replace non-MR33 wireless with incoming?", default_no=False):
+        mapping = _prompt_replacement_mapping(
+            [cast(str, d.get("serial")) for d in non_mr33_in_net if d.get("serial")],
+            incoming_wireless
+        )
+        for old_serial, new_serial in mapping:
+            try:
+                # clear name/address (best effort)
+                do_action(meraki_put, f"/devices/{old_serial}", data={"name": "", "address": ""})
+                # remove old
+                do_action(meraki_post, f"/networks/{network_id}/devices/remove", data={"serial": old_serial})
+                log_change('wireless_replace_remove', f"Removed old wireless {old_serial}", device_serial=old_serial)
+                removed_old.append(old_serial)
+            except Exception:
+                logging.exception("Failed to remove %s", old_serial)
+            try:
+                # claim new
+                do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": [new_serial]})
+                log_change('wireless_replace_claim', f"Claimed new wireless {new_serial}", device_serial=new_serial)
+                claimed_new.append(new_serial)
+            except Exception:
+                logging.exception("Failed to claim %s", new_serial)
+
+    # Ensure we don't also claim any wireless that we already claimed via mapping above
+    claimed_new_set: Set[str] = set(claimed_new)
+    serials_out = [s for s in serials_to_add if s not in claimed_new_set]  # still includes wireless unless skipped earlier
+    return serials_out, removed_old, claimed_new
+
 
 
 # =====================
