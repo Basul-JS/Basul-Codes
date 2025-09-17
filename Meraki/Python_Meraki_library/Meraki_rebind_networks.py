@@ -238,9 +238,15 @@ def ensure_mr33_and_handle_wireless_replacements(
     ]
     adding_has_mr33: bool = any(_is_mr33(add_models.get(s)) for s in incoming_wireless)
     if not has_mr33_now and not adding_has_mr33:
-        if not _prompt_yes_no("No MR33 detected in network or incoming. Proceed anyway?", default_no=True):
-            print("Aborting per user input (no MR33).")
-            raise SystemExit(1)
+        # Ask before touching wireless when no MR33 exists now nor being added
+        proceed = _prompt_yes_no("No MR33 detected in network or incoming. Proceed with wireless changes?", default_no=True)
+        if not proceed:
+            # User said "No": continue the overall workflow, but do NOT add or remove wireless.
+            #  - Leave existing wireless untouched (removed_old stays empty)
+            #  - Prevent new wireless from being claimed by removing them from serials_to_add
+            serials_to_add = [s for s in serials_to_add if s not in incoming_wireless]
+            return serials_to_add, [], []
+
     removed_old: List[str] = []
     claimed_new: List[str] = []
     if non_mr33_in_net and _prompt_yes_no("Replace non-MR33 wireless with incoming?", default_no=False):
