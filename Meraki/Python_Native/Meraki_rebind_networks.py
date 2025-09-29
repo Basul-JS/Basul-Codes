@@ -91,14 +91,15 @@ print(f"{'DRY RUN: ' if DRY_RUN else ''}Actions will {'not ' if DRY_RUN else ''}
 # Time-of-day warning (PROMINENT)
 # =====================
 now = datetime.now()
-cutoff_hour = 18
-cutoff_minute = 15
+cutoff_hour = 17
+cutoff_minute = 40
 if not DRY_RUN and ((now.hour < cutoff_hour) or (now.hour == cutoff_hour and now.minute < cutoff_minute)):
     print("\n" + "="*80)
     print("⚠️  WARNING: YOU ARE ABOUT TO MAKE LIVE CHANGES TO THE NETWORK ⚠️")
-    print("This may bring down the network if applied during business hours.")
+    print("This will bring down the network if applied during business hours.")
+    print("Please Ensure the Store is closed before continuing.")
     print(f"Current time: {now.strftime('%H:%M')}")
-    print("Recommended run time: AFTER 18:15.")
+    print("Recommended run time: AFTER 17:40.")
     print("="*80 + "\n")
     confirm = input("❗ Type 'YES' to proceed, or anything else to abort: ").strip()
     if confirm.upper() != "YES":
