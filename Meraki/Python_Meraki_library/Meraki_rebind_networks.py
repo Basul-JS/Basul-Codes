@@ -362,7 +362,7 @@ def fetch_devices(
 
     mx = [_mk(d) for d in devs if d['model'].startswith('MX')]
     ms = [_mk(d) for d in devs if d['model'].startswith('MS')]
-    mr = [_mk(d) for d in devs if d['model'].startswith('MR') or d['model'].startswith('CW916')]
+    mr = [_mk(d) for d in devs if d['model'].startswith('MR') or d['model'].startswith('CW9')]
 
     # Per-MS port overrides vs current template profile (if known)
     if template_id:
@@ -756,7 +756,7 @@ def select_device_order(org_id: str, serials: List[str], kind: str) -> List[str]
         try:
             inv = dashboard.organizations.getOrganizationInventoryDevice(org_id, s)
             model = (inv.get('model') or '').upper()
-            if kind == 'MR' and (model.startswith('MR') or model.startswith('CW916')):
+            if kind == 'MR' and (model.startswith('MR') or model.startswith('CW9')):
                 filtered.append((s, model))
             elif kind == 'MS' and model.startswith('MS'):
                 filtered.append((s, model))
@@ -840,7 +840,7 @@ def name_and_configure_claimed_devices(
             inv_by_serial[s] = {}
 
     mx_serials = [s for s in serials if (inv_by_serial.get(s, {}).get('model') or '').upper().startswith('MX')]
-    mr_serials = [s for s in serials if any((inv_by_serial.get(s, {}).get('model') or '').upper().startswith(p) for p in ('MR', 'CW916'))]
+    mr_serials = [s for s in serials if any((inv_by_serial.get(s, {}).get('model') or '').upper().startswith(p) for p in ('MR', 'CW9'))]
     ms_serials = [s for s in serials if (inv_by_serial.get(s, {}).get('model') or '').upper().startswith('MS')]
 
     if primary_mx_serial and primary_mx_serial in mx_serials:
