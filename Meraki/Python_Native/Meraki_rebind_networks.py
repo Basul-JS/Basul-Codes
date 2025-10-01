@@ -2,6 +2,8 @@
 # uses the native python library to rebind a meraki network to a new template 
     # allows the claiming and addining of new devices to the network replacing old devices / models
 # 20250905 - updated to enable WAN2 on the new MX's
+# 20251001 - paginated getter for networks
+# 20251001 - update dhcp handling logic to be more robust
 
 
 import requests
@@ -21,7 +23,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.utils import get_column_letter
 from typing import cast
 import unicodedata
-
+from difflib import SequenceMatcher
 
 # =====================
 # Config & Constants
@@ -482,12 +484,94 @@ def apply_port_overrides(serial: str, overrides: Dict[str, Dict[str, Any]]) -> N
 # =====================
 # Domain helpers (raw API)
 # =====================
+def meraki_list_networks_all(org_id: str) -> List[Dict[str, Any]]:
+    """
+    Returns ALL networks in an org using Meraki's cursor pagination.
+    """
+    all_nets: List[Dict[str, Any]] = []
+    per_page: int = 1000
+    starting_after: Optional[str] = None
+
+    while True:
+        params: Dict[str, Any] = {"perPage": per_page}
+        if starting_after:
+            params["startingAfter"] = starting_after
+
+        page_raw: Any = meraki_get(f"/organizations/{org_id}/networks", params=params)
+        page: List[Dict[str, Any]] = page_raw if isinstance(page_raw, list) else []
+
+        if not page:
+            break
+
+        all_nets.extend(page)
+
+        # Stop if this was the last page
+        if len(page) < per_page:
+            break
+
+        last = page[-1]
+        starting_after = str(last.get("id") or "")
+        if not starting_after:
+            break
+
+    return all_nets
+
+def _norm(s: Optional[str]) -> str:
+    """
+    Normalize a string for robust matching:
+    - NFKC unicode normalization
+    - convert en/em dashes to hyphen
+    - collapse whitespace
+    - casefold for case-insensitive compare
+    """
+    base: str = s or ""
+    base = unicodedata.normalize("NFKC", base)
+    base = base.replace("–", "-").replace("—", "-")
+    base = re.sub(r"\s+", " ", base).strip()
+    return base.casefold()
+
 def fetch_matching_networks(org_id: str, partial: str) -> List[Dict[str, Any]]:
-    nets = meraki_get(f"/organizations/{org_id}/networks")
-    partial_lower = partial.lower()
-    matches = [n for n in nets if partial_lower in n.get('name', '').lower()]
-    logging.debug(f"Found {len(matches)} networks matching '{partial}'")
+    """
+    Paginated + normalized substring search over network names.
+    """
+    partial_n: str = _norm(partial)
+    nets: List[Dict[str, Any]] = meraki_list_networks_all(org_id)
+    matches: List[Dict[str, Any]] = []
+    for n in nets:
+        name = _norm(n.get("name"))
+        if partial_n in name:
+            matches.append(n)
+
+    logging.debug("Found %d networks matching '%s' (normalized)", len(matches), partial)
     return matches
+
+def _similarity(a: str, b: str) -> float:
+    """
+    Lightweight similarity score for suggestions when no matches.
+    """
+    return SequenceMatcher(None, a, b).ratio()
+
+def fetch_matching_networks_with_suggestions(
+    org_id: str, partial: str
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns (exact/substring matches, suggestions_if_no_matches).
+    Suggestions are the top 5 by similarity (>= 0.6).
+    """
+    nets: List[Dict[str, Any]] = meraki_list_networks_all(org_id)
+    partial_n: str = _norm(partial)
+
+    matches: List[Dict[str, Any]] = [n for n in nets if partial_n in _norm(n.get("name"))]
+    if matches:
+        return matches, []
+
+    scored: List[Tuple[Dict[str, Any], float]] = [
+        (n, _similarity(partial_n, _norm(n.get("name")))) for n in nets
+    ]
+    scored.sort(key=lambda t: t[1], reverse=True)
+    suggestions: List[Dict[str, Any]] = [n for (n, score) in scored[:5] if score >= 0.6]
+    return [], suggestions
+
 
 def fetch_devices(
     org_id: str,
@@ -569,32 +653,92 @@ def vlans_enabled(network_id: str) -> Optional[bool]:
         logging.exception("Could not read VLANs settings")
         return None
 
-def update_vlans(network_id: str, network_name: str, vlan_list: List[Dict[str, Any]]):
+def _dhcp_mode(val: Optional[str]) -> str:
+    """
+    Normalize Meraki dhcpHandling into one of: 'server' | 'relay' | 'off'.
+    Meraki UI/API strings vary; we defensively bucket them.
+    """
+    v = (val or "").strip().lower()
+    # common variants from API/UI
+    if v in {"run a dhcp server", "run dhcp server", "server", "enabled", "on"}:
+        return "server"
+    if "relay" in v:
+        return "relay"
+    if v in {"do not respond", "do not respond to dhcp requests", "off", "disabled", "none"}:
+        return "off"
+    # default safe bucket: treat unknown as 'off' to prevent illegal fields
+    return "off"
+
+def _nonempty(x: Any) -> bool:
+    if x is None:
+        return False
+    if isinstance(x, (list, dict)) and len(x) == 0:
+        return False
+    if isinstance(x, str) and x.strip() == "":
+        return False
+    return True
+
+def update_vlans(network_id: str, network_name: str, vlan_list: List[Dict[str, Any]]) -> None:
+    """
+    PUT only fields that are valid for the VLAN's DHCP mode:
+      - server: may send fixedIpAssignments, reservedIpRanges (and dns if you keep it)
+      - relay: may send dhcpRelayServerIps (do NOT send fixed/reserved)
+      - off:   do NOT send fixed/reserved/relay
+    """
     for v in vlan_list:
-        payload = {
-            'applianceIp': v.get('applianceIp'),
-            'subnet': v.get('subnet'),
-            'dhcpHandling': v.get('dhcpHandling'),
-            'fixedIpAssignments': v.get('fixedIpAssignments', {}),
-            'reservedIpRanges': v.get('reservedIpRanges', []),
-        }
+        vlan_id = str(v.get("id", ""))
+        # Always include these if present
+        payload: Dict[str, Any] = {}
+        if _nonempty(v.get("applianceIp")):
+            payload["applianceIp"] = v.get("applianceIp")
+        if _nonempty(v.get("subnet")):
+            payload["subnet"] = v.get("subnet")
+
+        # Respect/forward existing dhcpHandling (don’t invent values)
+        dhcp_handling_raw = v.get("dhcpHandling")
+        if _nonempty(dhcp_handling_raw):
+            payload["dhcpHandling"] = dhcp_handling_raw
+
+        mode = _dhcp_mode(dhcp_handling_raw)
+
+        if mode == "server":
+            # Only include if non-empty; empty dict/list is fine to omit
+            if _nonempty(v.get("fixedIpAssignments")):
+                payload["fixedIpAssignments"] = v.get("fixedIpAssignments")
+            if _nonempty(v.get("reservedIpRanges")):
+                payload["reservedIpRanges"] = v.get("reservedIpRanges")
+            # Optional extras you might be carrying; guard them too
+            if _nonempty(v.get("dnsNameservers")):
+                payload["dnsNameservers"] = v.get("dnsNameservers")
+
+        elif mode == "relay":
+            # For relay, Meraki expects dhcpRelayServerIps; do NOT send fixed/reserved
+            # Accept either singular or plural key from your source
+            relay_ips = v.get("dhcpRelayServerIps") or v.get("dhcpRelayServerIp")
+            if _nonempty(relay_ips):
+                payload["dhcpRelayServerIps"] = relay_ips
+
+        # mode == "off": intentionally do not include fixed/reserved/relay fields
+
         try:
-            do_action(meraki_put, f"/networks/{network_id}/appliance/vlans/{v['id']}", data=payload)
-            logging.debug(f"Updated VLAN {v['id']}")
+            do_action(meraki_put, f"/networks/{network_id}/appliance/vlans/{vlan_id}", data=payload)
+            logging.debug("Updated VLAN %s with payload: %s", vlan_id, payload)
             log_change(
                 'vlan_update',
-                f"Updated VLAN {v['id']}",
+                f"Updated VLAN {vlan_id}",
                 device_name=f"Network: {network_id}",
                 network_id=network_id,
                 network_name=network_name,
-                misc=json.dumps(payload)
+                misc=json.dumps(payload),
             )
         except MerakiAPIError as e:
+            # Keep your existing VLAN-disabled handling
             if is_vlans_disabled_error(e):
                 raise
-            logging.exception(f"Failed to update VLAN {v.get('id')}")
+            logging.exception("Failed to update VLAN %s (HTTP %s): %s", vlan_id, e.status_code, e.text)
         except Exception:
-            logging.exception(f"Failed to update VLAN {v.get('id')}")
+            logging.exception("Failed to update VLAN %s", vlan_id)
+
 
 def classify_serials_for_binding(org_id: str, net_id: str, serials: List[str]):
     already, elsewhere, avail = [], [], []
