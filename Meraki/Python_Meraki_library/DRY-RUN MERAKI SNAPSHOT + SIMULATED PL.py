@@ -123,21 +123,68 @@ def select_org() -> str:
         sys.exit(1)
     return cast(str, orgs[int(raw) - 1]["id"])
 
-def select_network(org_id: str) -> Tuple[str, str]:
-    nets = get_all_networks(org_id)
-    if not nets:
-        print("❌ No networks found in org")
-        sys.exit(1)
+from typing import Tuple, List, Dict, Any
 
-    for i, n in enumerate(nets, 1):
-        print(f"{i}. {n['name']} (ID: {n['id']})")
+def fetch_matching_networks(org_id: str, partial: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Return two lists:
+      - matches: networks where partial is a substring (case-insensitive)
+      - suggestions: networks starting with the same first letter(s) if no matches
+    """
+    nets: List[Dict[str, Any]] = get_all_networks(org_id)
+    partial_lower = partial.lower()
 
-    raw = input("Select network by number: ").strip()
-    if not raw.isdigit() or not (1 <= int(raw) <= len(nets)):
-        print("❌ Invalid selection")
-        sys.exit(1)
-    chosen = nets[int(raw) - 1]
-    return cast(str, chosen["id"]), cast(str, chosen["name"])
+    matches = [n for n in nets if partial_lower in (n.get("name", "")).lower()]
+
+    suggestions: List[Dict[str, Any]] = []
+    if not matches and partial_lower:
+        # crude "did you mean" → prefix suggestion
+        suggestions = [n for n in nets if (n.get("name") or "").lower().startswith(partial_lower[:2])]
+
+    return matches, suggestions
+
+
+def select_network_interactive(org_id: str) -> Tuple[str, str]:
+    """
+    Prompt interactively to select a network by searching with a partial name.
+    Supports substring search, suggestions, and multi-choice lists.
+    """
+    while True:
+        partial = input("Enter partial network name to search: ").strip()
+        if not partial:
+            print("No network selected.")
+            sys.exit(1)
+
+        matches, suggestions = fetch_matching_networks(org_id, partial)
+
+        if matches:
+            if len(matches) == 1:
+                m = matches[0]
+                print(f"Selected: {m['name']} ({m['id']})")
+                return str(m["id"]), str(m["name"])
+
+            print("\nMultiple matches:")
+            for i, n in enumerate(matches, 1):
+                print(f"{i}. {n['name']} (ID: {n['id']})")
+
+            raw = input("Pick # : ").strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(matches):
+                chosen = matches[int(raw) - 1]
+                print(f"Selected: {chosen['name']} ({chosen['id']})")
+                return str(chosen["id"]), str(chosen["name"])
+            else:
+                print("Invalid choice.")
+        else:
+            print("No exact/substring matches found.")
+            if suggestions:
+                print("Did you mean:")
+                for n in suggestions:
+                    print(f" - {n['name']} (ID: {n['id']})")
+
+        retry = input("Search again? (y/N): ").strip().lower()
+        if retry != "y":
+            print("No network selected.")
+            sys.exit(1)
 
 def fetch_devices(network_id: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     try:
@@ -679,7 +726,7 @@ def export_diff(
 if __name__ == "__main__":
     print("=== DRY RUN: Snapshot + Simulated Plan (NO CHANGES MADE) ===")
     org_id = select_org()
-    net_id, net_name = select_network(org_id)
+    net_id, net_name = select_network_interactive(org_id)
 
     # Live reads
     mx, ms, mr = fetch_devices(net_id)

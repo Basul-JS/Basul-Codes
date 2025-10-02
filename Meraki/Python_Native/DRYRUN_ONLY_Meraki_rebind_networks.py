@@ -5,6 +5,7 @@ import requests
 import logging
 import re
 import json
+from getpass import getpass
 from datetime import datetime
 import csv
 import os
@@ -82,10 +83,15 @@ def log_change(
 def validate_api_key(key: str) -> bool:
     return bool(re.fullmatch(r'[A-Fa-f0-9]{40}', key or ''))
 
-API_KEY = os.getenv("MERAKI_API_KEY") or input("Enter your Meraki API key (hidden echo off not available in dry stub): ").strip()
-if not validate_api_key(API_KEY):
-    print("Invalid API key format (expecting 40 hex chars). Exiting.")
+API_KEY: Optional[str] = None
+for _ in range(4):
+    API_KEY = getpass("Enter your Meraki API key (hidden): ")
+    if validate_api_key(API_KEY):
+        break
+else:
+    print("❌ Invalid API key after 4 attempts")
     sys.exit(1)
+
 
 HEADERS = {
     "X-Cisco-Meraki-API-Key": API_KEY,
