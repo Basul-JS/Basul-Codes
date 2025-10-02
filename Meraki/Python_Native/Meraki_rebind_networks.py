@@ -1299,6 +1299,40 @@ def remove_recently_added_tag(network_id: str):
             except Exception:
                 logging.exception(f"Failed to remove 'recently-added' from {d['serial']}")
 
+def _pick_template_by_vlan_count(
+    templates: List[Dict[str, Any]],
+    vlan_count: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    """
+    Return the first template whose name matches a pattern derived from vlan_count.
+    Currently recognizes 3- and 5-VLAN conventions via regex.
+
+    Adjust patterns to match your naming scheme.
+    """
+    if vlan_count not in (3, 5):
+        return None
+
+    patterns: List[str]
+    if vlan_count == 3:
+        # e.g. "NO LEGACY ... MX"
+        patterns = [r'NO\s*LEGACY.*MX\b']
+    else:  # vlan_count == 5
+        # e.g. "3 X DATA_VLAN ... MX75"
+        patterns = [r'3\s*X\s*DATA[_\s-]*VLAN.*MX75\b']
+
+    for pat in patterns:
+        rx = re.compile(pat, re.IGNORECASE)
+        for t in templates:
+            name = (t.get('name') or '')
+            if rx.search(name):
+                return t
+    return None
+
+def _current_vlan_count(network_id: str) -> Optional[int]:
+    """Use your existing fetch_vlan_details to determine the effective VLAN count."""
+    vlans = fetch_vlan_details(network_id)
+    return len(vlans) if isinstance(vlans, list) else None
+
 # ---------- Template rebind helpers (with rollback) ----------
 def list_and_rebind_template(
     org_id: str,
@@ -1316,9 +1350,17 @@ def list_and_rebind_template(
 ) -> Tuple[Optional[str], Optional[str], bool]:
     """
     Interactive template selection & (re)bind with robust rollback behavior.
+    Now includes VLAN-count based suggestion (regex on template name).
     Returns: (new_template_id, new_template_name, rolled_back)
     """
     skip_attempts = 0
+
+    # Fetch templates up-front and compute VLAN-count-based suggestion
+    all_templates_raw: Any = meraki_get(f"/organizations/{org_id}/configTemplates")
+    all_templates: List[Dict[str, Any]] = all_templates_raw if isinstance(all_templates_raw, list) else []
+
+    vlan_count: Optional[int] = _current_vlan_count(network_id)
+    suggested_tpl: Optional[Dict[str, Any]] = _pick_template_by_vlan_count(all_templates, vlan_count)
 
     while True:
         print(f"\nCurrent network: {network_name} (ID: {network_id})")
@@ -1339,20 +1381,40 @@ def list_and_rebind_template(
         else:
             print("No template bound.\n")
 
-        temps = meraki_get(f"/organizations/{org_id}/configTemplates")
-        filtered = temps
+        # Base filter (existing behavior): by MX model suffix if provided
+        filtered: List[Dict[str, Any]] = all_templates
         if mx_model_filter in {'MX67', 'MX75'}:
             suffix = mx_model_filter.upper()
-            filtered = [t for t in temps if (t.get('name') or '').strip().upper().endswith(suffix)]
+            filtered = [t for t in all_templates if (t.get('name') or '').strip().upper().endswith(suffix)]
             if not filtered:
                 print(f"(No templates ending with {suffix}; showing all templates instead.)")
-                filtered = temps
+                filtered = all_templates
 
+        # Reorder to place suggested template (if any) at the top and mark it
+        suggested_id: Optional[str] = suggested_tpl.get('id') if suggested_tpl else None
+        if suggested_id:
+            # Keep only unique templates; move suggested to front if present in filtered
+            filtered_ids = {t.get('id') for t in filtered}
+            if suggested_id in filtered_ids:
+                filtered = [t for t in filtered if t.get('id') == suggested_id] + \
+                           [t for t in filtered if t.get('id') != suggested_id]
+
+        # Pretty print list with [AUTO] marker
+        print("Available templates:")
         for i, t in enumerate(filtered, 1):
-            print(f"{i}. {t['name']} (ID: {t['id']})")
+            name = t.get('name', '')
+            tid = t.get('id', '')
+            auto_mark = " [AUTO]" if suggested_id and t.get('id') == suggested_id else ""
+            print(f"{i}. {name}{auto_mark} (ID: {tid})")
+
+        # Brief hint about the suggestion
+        if suggested_tpl:
+            print(f"\nSuggestion: Based on VLAN count ({vlan_count}), '{suggested_tpl.get('name')}' looks appropriate.")
+            print("Press 'a' to auto-select the suggested template, or choose a number. "
+                  "Press Enter / type 'skip'/'cancel' to cancel (twice cancels with rollback).")
 
         sel = input(
-            "Select template # (or press Enter / type 'skip'/'cancel' to cancel — a second cancel will ROLLBACK): "
+            "Select template # (or 'a' to accept suggestion): "
         ).strip().lower()
 
         if sel in {"", "skip", "cancel"}:
@@ -1376,16 +1438,19 @@ def list_and_rebind_template(
             )
             return current_id, None, True  # rolled_back=True
 
-        if not sel.isdigit():
-            print("Invalid selection. Please enter a valid number or press Enter to cancel.")
-            continue
+        # Accept auto suggestion
+        if sel == "a" and suggested_tpl:
+            chosen = suggested_tpl
+        else:
+            if not sel.isdigit():
+                print("Invalid selection. Enter a number from the list, 'a' for suggestion, or press Enter to cancel.")
+                continue
+            idx = int(sel) - 1
+            if idx < 0 or idx >= len(filtered):
+                print("Invalid template number.")
+                continue
+            chosen = filtered[idx]
 
-        idx = int(sel) - 1
-        if idx < 0 or idx >= len(filtered):
-            print("Invalid template number.")
-            continue
-
-        chosen = filtered[idx]
         if chosen['id'] == current_id:
             print("No change (already bound to that template).")
             return current_id, chosen['name'], False
@@ -1395,10 +1460,10 @@ def list_and_rebind_template(
                 do_action(meraki_post, f"/networks/{network_id}/unbind")
             do_action(meraki_post, f"/networks/{network_id}/bind", data={"configTemplateId": chosen['id']})
             log_change('template_bind',
-                       f"Bound to template {chosen['name']} (ID: {chosen['id']})",
+                       f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
                        device_name=network_name, network_id=network_id, network_name=network_name)
-            print(f"✅ Bound to {chosen['name']}")
-            return chosen['id'], chosen['name'], False
+            print(f"✅ Bound to {chosen.get('name')}")
+            return chosen['id'], chosen.get('name'), False
 
         except MerakiAPIError as e:
             logging.error(f"Error binding template: {e}")
@@ -1443,6 +1508,7 @@ def list_and_rebind_template(
                 return current_id, None, True
             print(f"❌ Unexpected error: {e}. You can try again or cancel.")
             continue
+
 
 def bind_network_to_template(
     org_id: str,
@@ -2017,6 +2083,67 @@ if __name__ == '__main__':
         step_status['template_bound'] = "NA"
         step_status['vlans_updated'] = "NA"
         step_status['mx_removed'] = "NA"
+        
+            # --- Optional: VLAN-count based template suggestion in light flow ---
+    try:
+        all_templates_raw: Any = meraki_get(f"/organizations/{org_id}/configTemplates")
+        all_templates: List[Dict[str, Any]] = all_templates_raw if isinstance(all_templates_raw, list) else []
+
+        vlan_count = _current_vlan_count(network_id)
+        suggested_tpl = _pick_template_by_vlan_count(all_templates, vlan_count)
+
+        if suggested_tpl and (not old_template or suggested_tpl.get('id') != old_template):
+            print(
+                f"\nSuggestion: Based on VLAN count ({vlan_count}), "
+                f"'{suggested_tpl.get('name','')}' looks appropriate (ID: {suggested_tpl.get('id','')})."
+            )
+            ans = input("Press 'a' to bind to the suggested template, or Enter to keep current template: ").strip().lower()
+            if ans == 'a':
+                # Perform the bind and then validate VLANs using the same helper as in full flow
+                try:
+                    new_template = suggested_tpl.get('id')
+                    if old_template:
+                        do_action(meraki_post, f"/networks/{network_id}/unbind")
+                    do_action(meraki_post, f"/networks/{network_id}/bind", data={"configTemplateId": new_template})
+                    print(f"✅ Bound to {suggested_tpl.get('name','')}")
+
+                    # Reuse your post-bind VLAN validation & update routine
+                    bind_network_to_template(
+                        org_id=org_id,
+                        network_id=network_id,
+                        tpl_id=new_template,
+                        vlan_list=pre_change_vlans,  # use the VLANs we snapshot pre-change
+                        network_name=network_name,
+                        pre_change_devices=pre_change_devices,
+                        pre_change_vlans=pre_change_vlans,
+                        pre_change_template=pre_change_template,
+                        claimed_serials=[],
+                        removed_serials=[],
+                        ms_list=ms
+                    )
+                    step_status['template_bound'] = True
+                    step_status['vlans_updated'] = True
+
+                    # Refresh local view of template id for later steps/snapshots
+                    old_template = new_template
+
+                except MerakiAPIError as e:
+                    logging.exception("Light-flow suggested bind failed: %s %s", e.status_code, e.text)
+                    print("❌ Failed to bind suggested template in light flow.")
+                    step_status['template_bound'] = False
+                    # Leave vlans_updated as-is (NA)
+
+                except Exception:
+                    logging.exception("Light-flow suggested bind failed (unexpected)")
+                    print("❌ Failed to bind suggested template in light flow (unexpected error).")
+                    step_status['template_bound'] = False
+                    # Leave vlans_updated as-is (NA)
+        else:
+            logging.debug("No VLAN-based suggestion available in light flow (vlan_count=%s).", vlan_count)
+
+    except Exception:
+        logging.exception("Suggestion stage in light flow failed")
+
 
         # --- wireless MR33 pre-check + hard guard ---
         safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(

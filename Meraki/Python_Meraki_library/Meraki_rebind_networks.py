@@ -22,7 +22,7 @@ import os
 import time
 import signal
 import sys
-from typing import Any, Dict, List, Optional, Tuple, Set, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Set, Union, Iterable, cast
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
@@ -327,11 +327,107 @@ def apply_port_overrides(serial: str, overrides: Dict[str, Dict[str, Any]]) -> N
             logging.exception(f"Failed applying port overrides on {serial} port {pid}")
 
 # ------------- Domain helpers (library) -------------
+# ---- NEW / UPDATED HELPERS FOR NETWORK MATCHING & PAGINATION ----
+
+_DASH_VARIANTS: Tuple[str, ...] = ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212")
+
+def _normalize_name(s: Optional[str]) -> str:
+    """Normalize network names for reliable matching."""
+    if not s:
+        return ""
+    out = s
+    for ch in _DASH_VARIANTS:
+        out = out.replace(ch, "-")
+    # collapse whitespace, lower-case
+    out = re.sub(r"\s+", " ", out).strip().lower()
+    return out
+
+def get_all_networks(org_id: str) -> List[Dict[str, Any]]:
+    """
+    Return *all* networks for the organization, handling pagination in a way that
+    works across meraki SDK versions.
+    """
+    try:
+        # Preferred path (SDK paginates internally)
+        nets = dashboard.organizations.getOrganizationNetworks(
+            org_id, total_pages="all", perPage=1000  # type: ignore[arg-type]
+        )
+        if isinstance(nets, list):
+            return nets
+    except TypeError:
+        # Older SDKs may not accept total_pages argument
+        pass
+    except Exception:
+        logging.exception("get_all_networks: total_pages=all path failed, falling back")
+
+    # Fallback: manual page-walk using startingAfter
+    results: List[Dict[str, Any]] = []
+    starting_after: Optional[str] = None
+    seen_ids: Set[str] = set()
+
+    while True:
+        try:
+            batch: List[Dict[str, Any]]
+            if starting_after:
+                batch = dashboard.organizations.getOrganizationNetworks(
+                    org_id, perPage=1000, startingAfter=starting_after
+                )
+            else:
+                batch = dashboard.organizations.getOrganizationNetworks(
+                    org_id, perPage=1000
+                )
+        except Exception:
+            logging.exception("get_all_networks: page fetch failed")
+            break
+
+        if not batch:
+            break
+
+        for n in batch:
+            nid = str(n.get("id", ""))
+            if nid and nid not in seen_ids:
+                results.append(n)
+                seen_ids.add(nid)
+
+        # The SDK auto-follows Link headers when possible; if not, approximate:
+        if len(batch) < 1000:
+            break
+        starting_after = str(batch[-1].get("id", "")) or None
+        if not starting_after:
+            break
+
+    return results
+
 def fetch_matching_networks(org_id: str, partial: str) -> List[Dict[str, Any]]:
-    nets = dashboard.organizations.getOrganizationNetworks(org_id)
-    partial_lower = partial.lower()
-    matches = [n for n in nets if partial_lower in n.get('name', '').lower()]
-    logging.debug(f"Found {len(matches)} networks matching '{partial}'")
+    """
+    More reliable matching:
+      - Accept direct Network ID (exact match).
+      - Case/space/Unicode-dash insensitive substring matching.
+      - If input looks numeric (e.g., store code), match as substring token too.
+    """
+    partial_norm: str = _normalize_name(partial)
+    all_nets: List[Dict[str, Any]] = get_all_networks(org_id)
+
+    # Direct ID match first
+    direct = [n for n in all_nets if str(n.get("id", "")).strip() == partial.strip()]
+    if direct:
+        logging.debug("fetch_matching_networks: direct ID match")
+        return direct
+
+    # Normalized name contains
+    matches: List[Dict[str, Any]] = []
+    for n in all_nets:
+        nname_raw: str = str(n.get("name", "") or "")
+        nname_norm: str = _normalize_name(nname_raw)
+        if partial_norm and partial_norm in nname_norm:
+            matches.append(n)
+
+    # If no matches and partial is a numeric token, try as a bare substring (without normalization)
+    if not matches and re.fullmatch(r"\d{2,}", partial.strip()):
+        num = partial.strip()
+        matches = [n for n in all_nets if num in str(n.get("name", "") or "")]
+
+    logging.debug("Found %d networks matching '%s'", len(matches), partial)
     return matches
 
 def fetch_devices(
@@ -429,30 +525,59 @@ def vlans_enabled(network_id: str) -> Optional[bool]:
     except Exception:
         logging.exception("Could not read VLANs settings")
         return None
+# ---- UPDATED VLAN UPDATE (CONDITIONAL PAYLOAD FOR DHCP) ----
+def _dhcp_is_server(dhcp_handling: Optional[str]) -> bool:
+    """
+    Return True only when VLAN DHCP is 'Run a DHCP server'.
+    Be defensive to handle minor string variations.
+    """
+    val = (dhcp_handling or "").strip().lower()
+    # Canonical UI/API value is 'Run a DHCP server'
+    # Accept tolerant variants just in case.
+    return val in {
+        "run a dhcp server", "dhcp server", "server", "enabled", "on"
+    }
 
-def update_vlans(network_id: str, network_name: str, vlan_list: List[Dict[str, Any]]):
+def update_vlans(network_id: str, network_name: str, vlan_list: List[Dict[str, Any]]) -> None:
     for v in vlan_list:
-        payload = {
-            'applianceIp': v.get('applianceIp'),
-            'subnet': v.get('subnet'),
-            'dhcpHandling': v.get('dhcpHandling'),
-            'fixedIpAssignments': v.get('fixedIpAssignments', {}),
-            'reservedIpRanges': v.get('reservedIpRanges', []),
+        # Base payload (always safe)
+        payload: Dict[str, Any] = {
+            "applianceIp": v.get("applianceIp"),
+            "subnet": v.get("subnet"),
+            "dhcpHandling": v.get("dhcpHandling"),
         }
+
+        # Only send static/reserved assignments when DHCP == SERVER
+        if _dhcp_is_server(v.get("dhcpHandling")):
+            if "fixedIpAssignments" in v and isinstance(v["fixedIpAssignments"], dict):
+                payload["fixedIpAssignments"] = v["fixedIpAssignments"]
+            if "reservedIpRanges" in v and isinstance(v["reservedIpRanges"], list):
+                payload["reservedIpRanges"] = v["reservedIpRanges"]
+        else:
+            # Ensure these fields are NOT present for OFF/RELAY
+            payload.pop("fixedIpAssignments", None)
+            payload.pop("reservedIpRanges", None)
+
         try:
-            do_action(dashboard.appliance.updateNetworkApplianceVlan, network_id, v['id'], **payload)
-            logging.debug(f"Updated VLAN {v['id']}")
-            log_change('vlan_update', f"Updated VLAN {v['id']}",
-                       device_name=f"Network: {network_id}",
-                       network_id=network_id, network_name=network_name,
-                       misc=json.dumps(payload))
+            do_action(
+                dashboard.appliance.updateNetworkApplianceVlan,  # type: ignore[attr-defined]
+                network_id, v["id"], **payload
+            )
+            logging.debug("Updated VLAN %s with payload keys: %s", v.get("id"), list(payload.keys()))
+            log_change(
+                "vlan_update",
+                f"Updated VLAN {v.get('id')}",
+                device_name=f"Network: {network_id}",
+                network_id=network_id,
+                network_name=network_name,
+                misc=json.dumps(payload),
+            )
         except meraki.APIError as e:
             if is_vlans_disabled_error(e):
                 raise
-            logging.exception(f"Failed to update VLAN {v.get('id')}")
+            logging.exception("Failed to update VLAN %s", v.get("id"))
         except Exception:
-            logging.exception(f"Failed to update VLAN {v.get('id')}")
-
+            logging.exception("Failed to update VLAN %s", v.get("id"))
 
 def classify_serials_for_binding(org_id: str, net_id: str, serials: List[str]):
     already, elsewhere, avail = [], [], []
@@ -1766,18 +1891,20 @@ def export_post_change_snapshot(org_id: str, network_id: str, network_name: str)
                network_id=network_id, network_name=network_name)
 
 # ------------- Selectors (org/network) -------------
+# ---- UPDATED SELECTOR TO LEVERAGE ROBUST MATCHING (accepts ID too) ----
 def select_network_interactive(org_id: str) -> Tuple[str, str]:
     while True:
-        partial = input("Enter partial network name to search (or press Enter to cancel): ").strip()
+        partial: str = input("Enter partial network name or network ID (or press Enter to cancel): ").strip()
         if not partial:
             print("\n❌ No Network selected -----------\n   Please retry when Network is known *******")
             sys.exit(1)
 
-        networks = fetch_matching_networks(org_id, partial)
+        networks: List[Dict[str, Any]] = fetch_matching_networks(org_id, partial)
+
         if not networks:
             print("\n❌ No matching networks found -----------")
             retry = input("Search again? (y/N): ").strip().lower()
-            if retry == 'y':
+            if retry == "y":
                 continue
             print("\n❌ No Network selected -----------\n   Please retry when Network is known *******")
             sys.exit(1)
@@ -1788,11 +1915,13 @@ def select_network_interactive(org_id: str) -> Tuple[str, str]:
             confirm = input("Use this network? (Y/n): ").strip().lower()
             if confirm in {"", "y", "yes"}:
                 print(f"Selected network: {only['name']} (ID: {only['id']})")
-                return only['id'], only['name']
+                return cast(str, only['id']), cast(str, only['name'])
             continue
 
+        # Multiple matches — show a tidy, deterministic order
+        networks_sorted = sorted(networks, key=lambda n: _normalize_name(str(n.get("name", ""))))
         print("\nMultiple networks found:")
-        for idx, net in enumerate(networks, 1):
+        for idx, net in enumerate(networks_sorted, 1):
             print(f"{idx}. {net['name']} (ID: {net['id']})")
 
         while True:
@@ -1802,10 +1931,10 @@ def select_network_interactive(org_id: str) -> Tuple[str, str]:
                 sys.exit(1)
             if raw.isdigit():
                 choice = int(raw)
-                if 1 <= choice <= len(networks):
-                    chosen = networks[choice - 1]
+                if 1 <= choice <= len(networks_sorted):
+                    chosen = networks_sorted[choice - 1]
                     print(f"Selected network #{choice}: {chosen['name']} (ID: {chosen['id']})")
-                    return chosen['id'], chosen['name']
+                    return cast(str, chosen['id']), cast(str, chosen['name'])
             print("❌ Invalid selection. Please enter a valid number from the list.")
 
 def select_org() -> str:
