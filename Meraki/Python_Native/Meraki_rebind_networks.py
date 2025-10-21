@@ -4,6 +4,7 @@
 # 20250905 - updated to enable WAN2 on the new MX's
 # 20251001 - paginated getter for networks
 # 20251001 - update dhcp handling logic to be more robust
+# 20251020 - update to to list the number of networks bound to each template and only lists templates that have less than 90 networks bound
 
 
 import requests
@@ -17,7 +18,7 @@ import os
 import time
 import signal
 import sys
-from typing import Any, Dict, List, Optional, Tuple, Set, Union
+from typing import Any, Dict, List, Optional, Tuple, Set, Union, Callable
 from openpyxl import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.utils import get_column_letter
@@ -1236,6 +1237,89 @@ def _current_vlan_count(network_id: str) -> Optional[int]:
     vlans = fetch_vlan_details(network_id)
     return len(vlans) if isinstance(vlans, list) else None
 
+# Simple in-memory cache so we don't recount the same template over and over
+_TEMPLATE_COUNT_CACHE: Dict[str, int] = {}
+
+def _count_networks_bound_to_template(org_id: str, template_id: str) -> int:
+    """
+    Returns how many networks are bound to a given config template.
+
+    Primary:  GET /organizations/{orgId}/configTemplates/{templateId}/networks (paginated)
+    Fallback: GET /organizations/{orgId}/networks (paginated) and count where
+              network['configTemplateId'] == template_id
+    """
+    if not template_id:
+        return 0
+    if template_id in _TEMPLATE_COUNT_CACHE :
+        return _TEMPLATE_COUNT_CACHE[template_id]
+
+    def _primary_count() -> int:
+        total = 0
+        per_page = 1000
+        starting_after: Optional[str] = None
+        while True:
+            params: Dict[str, Any] = {"perPage": per_page}
+            if starting_after:
+                params["startingAfter"] = starting_after
+            page_raw: Any = meraki_get(
+                f"/organizations/{org_id}/configTemplates/{template_id}/networks",
+                params=params
+            )
+            page: List[Dict[str, Any]] = page_raw if isinstance(page_raw, list) else []
+            if not page:
+                break
+            total += len(page)
+            if len(page) < per_page:
+                break
+            last = page[-1]
+            starting_after = str(last.get("id") or last.get("networkId") or last.get("name") or "")
+            if not starting_after:
+                break
+        return total
+
+    def _fallback_count() -> int:
+        total = 0
+        per_page = 1000
+        starting_after: Optional[str] = None
+        while True:
+            params: Dict[str, Any] = {"perPage": per_page}
+            if starting_after:
+                params["startingAfter"] = starting_after
+            page_raw: Any = meraki_get(f"/organizations/{org_id}/networks", params=params)
+            page: List[Dict[str, Any]] = page_raw if isinstance(page_raw, list) else []
+            if not page:
+                break
+            # Count only those bound to this template
+            total += sum(1 for n in page if (n.get("configTemplateId") == template_id))
+            if len(page) < per_page:
+                break
+            last = page[-1]
+            starting_after = str(last.get("id") or "")
+            if not starting_after:
+                break
+        return total
+
+    try:
+        count = _primary_count()
+    except MerakiAPIError as e:
+        # Typical: 404 Not Found or 403 Forbidden -> use fallback
+        if e.status_code in (403, 404):
+            logging.warning(
+                "Primary count endpoint unavailable for template %s (HTTP %s). Falling back to org networks scan.",
+                template_id, e.status_code
+            )
+            count = _fallback_count()
+        else:
+            logging.exception("Primary count failed for template %s; using fallback.", template_id)
+            count = _fallback_count()
+    except Exception:
+        logging.exception("Primary count raised unexpected error for template %s; using fallback.", template_id)
+        count = _fallback_count()
+
+    _TEMPLATE_COUNT_CACHE[template_id] = count
+    return count
+
+
 # ---------- Template rebind helpers (with rollback) ----------
 def list_and_rebind_template(
     org_id: str,
@@ -1251,63 +1335,86 @@ def list_and_rebind_template(
     ms_list: Optional[List[Dict[str, Any]]] = None,
     mx_model_filter: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], bool]:
+    """
+    Interactive template selector that:
+      - shows the number of networks bound to each template
+      - only lists templates with < 90 networks bound
+      - preserves existing VLAN-based suggestion behavior
+    """
     skip_attempts = 0
 
+    # Fetch all templates
     all_templates_raw: Any = meraki_get(f"/organizations/{org_id}/configTemplates")
     all_templates: List[Dict[str, Any]] = all_templates_raw if isinstance(all_templates_raw, list) else []
 
+    # Count networks bound per template and filter to < 90
+    eligible: List[Dict[str, Any]] = []   # known counts < 90
+    unknown: List[Dict[str, Any]] = []    # count failed; include as unknown so user can still proceed
+
+    for t in all_templates:
+        tid = t.get("id")
+        if not tid:
+            continue
+        try:
+            bound_count = _count_networks_bound_to_template(org_id, tid)
+            t2 = dict(t); t2["_boundCount"] = bound_count  # int
+            if bound_count < 90:
+                eligible.append(t2)
+        except Exception:
+            logging.exception("Failed to compute bound count for template %s; including as unknown.", tid)
+            t2 = dict(t); t2["_boundCount"] = None         # unknown
+            unknown.append(t2)
+
+    # If we have no eligible ones, fall back to unknown list (so the menu isn't empty)
+    if not eligible and not unknown:
+        print("ℹ️ No templates available (could not fetch template list).")
+        return current_id, None, False
+
+    if not eligible and unknown:
+        print("⚠️ Could not compute bound counts (or none are under 90). Showing templates with unknown counts; they may exceed the 90 limit.")
+        filtered: List[Dict[str, Any]] = unknown[:]
+    else:
+        # Prefer eligible (<90), but also append unknown so you still have options
+        filtered = eligible + unknown
+
+        # Keep existing VLAN-count suggestion logic
     vlan_count: Optional[int] = _current_vlan_count(network_id)
-    suggested_tpl: Optional[Dict[str, Any]] = _pick_template_by_vlan_count(all_templates, vlan_count)
+    suggested_tpl: Optional[Dict[str, Any]] = _pick_template_by_vlan_count(filtered, vlan_count)
 
-    while True:
-        print(f"\nCurrent network: {network_name} (ID: {network_id})")
-        log_change('current_network_info', f"Current network: {network_name}",
-                   org_id=org_id, network_id=network_id, network_name=network_name)
-
-        if current_id:
-            try:
-                curr = meraki_get(f"/organizations/{org_id}/configTemplates/{current_id}")
-                print(f"Bound template: {curr.get('name','<unknown>')} (ID: {current_id})\n")
-                log_change('bound_template_info',
-                           f"Bound template {curr.get('name','<unknown>')} ({current_id})",
-                           network_id=network_id, network_name=network_name)
-            except Exception:
-                print(f"Bound template ID: {current_id}\n")
-                log_change('bound_template_info', f"Bound template ID: {current_id}",
-                           network_id=network_id, network_name=network_name)
+    # Optional model suffix filter (MX67/MX75) over the already filtered list
+    if mx_model_filter in {'MX67', 'MX75'}:
+        suffix = mx_model_filter.upper()
+        subset = [t for t in filtered if (t.get('name') or '').strip().upper().endswith(suffix)]
+        if subset:
+            filtered = subset
         else:
-            print("No template bound.\n")
+            print(f"(No templates ending with {suffix} in the current list; showing all eligible/unknown templates instead.)")
 
-        filtered: List[Dict[str, Any]] = all_templates
-        if mx_model_filter in {'MX67', 'MX75'}:
-            suffix = mx_model_filter.upper()
-            filtered = [t for t in all_templates if (t.get('name') or '').strip().upper().endswith(suffix)]
-            if not filtered:
-                print(f"(No templates ending with {suffix}; showing all templates instead.)")
-                filtered = all_templates
+    # Bubble the suggestion to the top if present in the filtered set
+    suggested_id: Optional[str] = suggested_tpl.get('id') if suggested_tpl else None
+    if suggested_id:
+        idset = {t.get('id') for t in filtered}
+        if suggested_id in idset:
+            filtered = [t for t in filtered if t.get('id') == suggested_id] + \
+                       [t for t in filtered if t.get('id') != suggested_id]
 
-        suggested_id: Optional[str] = suggested_tpl.get('id') if suggested_tpl else None
-        if suggested_id:
-            filtered_ids = {t.get('id') for t in filtered}
-            if suggested_id in filtered_ids:
-                filtered = [t for t in filtered if t.get('id') == suggested_id] + \
-                           [t for t in filtered if t.get('id') != suggested_id]
-
-        print("Available templates:")
+    # --- Selection loop ---
+    while True:
+        print("Available templates (< 90 bound or unknown):")
         for i, t in enumerate(filtered, 1):
             name = t.get('name', '')
             tid = t.get('id', '')
+            cnt = t.get('_boundCount', None)
+            cnt_str = "?" if cnt is None else str(cnt)
             auto_mark = " [AUTO]" if suggested_id and t.get('id') == suggested_id else ""
-            print(f"{i}. {name}{auto_mark} (ID: {tid})")
+            print(f"{i}. {name}{auto_mark} (ID: {tid}) — {cnt_str} bound")
 
         if suggested_tpl:
             print(f"\nSuggestion: Based on VLAN count ({vlan_count}), '{suggested_tpl.get('name')}' looks appropriate.")
             print("Press 'a' to auto-select the suggested template, or choose a number. "
                   "Press Enter / type 'skip'/'cancel' to cancel (twice cancels with rollback).")
 
-        sel = input(
-            "Select template # (or 'a' to accept suggestion): "
-        ).strip().lower()
+        sel = input("Select template # (or 'a' to accept suggestion): ").strip().lower()
 
         if sel in {"", "skip", "cancel"}:
             skip_attempts += 1
@@ -1358,7 +1465,7 @@ def list_and_rebind_template(
 
         except MerakiAPIError as e:
             logging.error(f"Error binding template: {e}")
-            must_rollback = True if current_id else False
+            must_rollback = bool(current_id)
             if is_vlans_disabled_error(e):
                 print("❌ VLANs are not enabled for this network. Binding failed and state may be partial.")
                 must_rollback = True
@@ -1399,6 +1506,10 @@ def list_and_rebind_template(
                 return current_id, None, True
             print(f"❌ Unexpected error: {e}. You can try again or cancel.")
             continue
+
+    # Safety net for type checkers; execution should never reach here.
+    return current_id, None, False
+
 
 def bind_network_to_template(
     org_id: str,
@@ -1629,17 +1740,57 @@ def _slug_filename(s: str) -> str:
     s = re.sub(r'[^A-Za-z0-9._-]+', '-', s).strip('-_')
     return s[:80]
 
-def _network_tag_from_name(name: str) -> str:
-    parts = name.split('-')
-    if len(parts) >= 2 and parts[1].isdigit():
-        return f"{parts[0]}-{parts[1]}"
-    return name
+def _json(x: Any) -> str:
+    try:
+        return json.dumps(x, ensure_ascii=False)
+    except Exception:
+        return str(x)
 
-def _network_number_from_name(name: str) -> str | None:
-    m = re.search(r'\b(\d{2,8})\b', name)
-    return m.group(1) if m else None
+def _normalize_tags_list(val) -> List[str]:
+    if isinstance(val, list):
+        return sorted(str(t) for t in val)
+    if isinstance(val, str):
+        return sorted([t for t in val.split() if t])
+    return []
 
-def export_network_snapshot_xlsx(
+def _autosize(ws):
+    max_col: int = ws.max_column
+    max_row: int = ws.max_row
+    for col_idx in range(1, max_col + 1):
+        max_len = 0
+        for row_idx in range(1, max_row + 1):
+            val = ws.cell(row=row_idx, column=col_idx).value
+            if val is not None:
+                s = str(val)
+                if len(s) > max_len:
+                    max_len = len(s)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
+
+def _dict_by_key(items: List[Dict[str, Any]], key: str) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        k = it.get(key)
+        if k is not None:
+            out[str(k)] = it
+    return out
+
+def _device_dict_by_serial(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return _dict_by_key(items, "serial")
+
+def _ms_port_overrides_map(ms_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for sw in ms_list:
+        serial = sw.get("serial")
+        if not serial:
+            continue
+        po = sw.get("port_overrides") or {}
+        if isinstance(po, dict):
+            out[str(serial)] = po
+    return out
+
+def _write_snapshot_sheet(
+    ws,
+    *,
     org_id: str,
     network_id: str,
     network_name: str,
@@ -1649,32 +1800,8 @@ def export_network_snapshot_xlsx(
     ms_list: List[Dict[str, Any]],
     mr_list: List[Dict[str, Any]],
     profileid_to_name: Optional[Dict[str, str]] = None,
-    outfile: Optional[str] = None,
-    filename_mode: str = "name",
-) -> None:
-    from openpyxl import Workbook
-    from openpyxl.worksheet.worksheet import Worksheet
-    from openpyxl.utils import get_column_letter
-
-    def _json(x: Any) -> str:
-        try:
-            return json.dumps(x, ensure_ascii=False)
-        except Exception:
-            return str(x)
-
-    if outfile:
-        out_path: str = outfile
-    else:
-        if filename_mode == "number":
-            base = _network_number_from_name(network_name) or _network_tag_from_name(network_name)
-        else:
-            base = _network_tag_from_name(network_name)
-        out_path = f"{_slug_filename(base)}_{timestamp}.xlsx"
-
-    wb: Workbook = Workbook()
-    ws: Worksheet = cast(Worksheet, wb.active)
-    ws.title = "Snapshot"
-
+    tpl_name_lookup: Optional[Callable[[str], str]] = None,
+):
     header: List[str] = [
         "section", "network_id", "network_name", "item_type",
         "col1", "col2", "col3", "col4", "col5",
@@ -1682,11 +1809,14 @@ def export_network_snapshot_xlsx(
     ]
     ws.append(header)
 
-    tpl_name: str = ""
+    tpl_name = ""
     if template_id:
         try:
-            tpl = meraki_get(f"/organizations/{org_id}/configTemplates/{template_id}")
-            tpl_name = str(tpl.get("name", "") or "")
+            if tpl_name_lookup:
+                tpl_name = tpl_name_lookup(template_id) or ""
+            else:
+                tpl = meraki_get(f"/organizations/{org_id}/configTemplates/{template_id}")
+                tpl_name = str(tpl.get("name", "") or "")
         except Exception:
             logging.exception("Could not fetch template name for snapshot")
 
@@ -1708,18 +1838,12 @@ def export_network_snapshot_xlsx(
             _json({k: v.get(k) for k in v.keys() - {"id", "name", "subnet", "applianceIp", "dhcpHandling"}}),
         ])
 
-    def _device_row(d: Dict[str, Any]) -> List[str]:
-        tags_val = d.get("tags", [])
-        if isinstance(tags_val, list):
-            tags_list = [str(t) for t in tags_val]
-        else:
-            tags_list = [t for t in str(tags_val or "").split() if t]
-
+    def device_row(d: Dict[str, Any]) -> List[str]:
+        tags_list = _normalize_tags_list(d.get("tags", []))
         sp_id: str = str(d.get("switchProfileId", "") or "")
         sp_name: str = str(d.get("switchProfileName", "") or "")
         if (not sp_name) and sp_id and profileid_to_name:
             sp_name = profileid_to_name.get(sp_id, "") or ""
-
         return [
             "devices", network_id, network_name, "device",
             str(d.get("serial", "") or ""),
@@ -1733,7 +1857,7 @@ def export_network_snapshot_xlsx(
         ]
 
     for d in (mx_list + ms_list + mr_list):
-        ws.append(_device_row(d))
+        ws.append(device_row(d))
 
     for sw in ms_list:
         changes_by_port: Dict[str, Dict[str, Any]] = sw.get("port_overrides") or {}
@@ -1751,48 +1875,111 @@ def export_network_snapshot_xlsx(
                     _json(val) if isinstance(val, (dict, list)) else "",
                 ])
 
-    max_col: int = ws.max_column
-    max_row: int = ws.max_row
-    for col_idx in range(1, max_col + 1):
-        max_len = 0
-        for row_idx in range(1, max_row + 1):
-            val = ws.cell(row=row_idx, column=col_idx).value
-            if val is not None:
-                s = str(val)
-                if len(s) > max_len:
-                    max_len = len(s)
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
+def _add_diff_row(ws, section: str, item: str, sub_item: str, field: str, pre, post, note: str = ""):
+    ws.append([
+        section, item, sub_item, field,
+        "" if isinstance(pre, (dict, list)) else str(pre),
+        "" if isinstance(post, (dict, list)) else str(post),
+        _json(pre) if isinstance(pre, (dict, list)) else "",
+        _json(post) if isinstance(post, (dict, list)) else "",
+        note
+    ])
 
-    wb.save(out_path)
-    print(f"📄 Snapshot exported to Excel: {out_path}")
-    log_change("snapshot_export", f"Exported network snapshot to {out_path}",
-               network_id=network_id, network_name=network_name)
 
-# ======= New extracted helpers to eliminate duplication =======
-def export_post_snapshot(org_id: str, network_id: str, network_name: str) -> None:
-    final_tpl_id = meraki_get(f"/networks/{network_id}").get('configTemplateId')
-    final_mx, final_ms, final_mr = fetch_devices(org_id, network_id, template_id=final_tpl_id)
-    final_vlans = fetch_vlan_details(network_id)
-    profileid_to_name: Dict[str, str] = {}
-    if final_tpl_id:
-        try:
-            final_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{final_tpl_id}/switch/profiles") or []
-            profileid_to_name = {p['switchProfileId']: p['name'] for p in final_profiles}
-        except Exception:
-            logging.exception("Failed fetching final template switch profiles")
 
-    export_network_snapshot_xlsx(
+def export_combined_snapshot_xlsx(
+    *,
+    org_id: str,
+    network_id: str,
+    network_name: str,
+
+    # PRE
+    pre_template_id: Optional[str],
+    pre_vlan_list: List[Dict[str, Any]],
+    pre_mx_list: List[Dict[str, Any]],
+    pre_ms_list: List[Dict[str, Any]],
+    pre_mr_list: List[Dict[str, Any]],
+    pre_profileid_to_name: Optional[Dict[str, str]] = None,
+
+    # POST
+    post_template_id: Optional[str],
+    post_vlan_list: List[Dict[str, Any]],
+    post_mx_list: List[Dict[str, Any]],
+    post_ms_list: List[Dict[str, Any]],
+    post_mr_list: List[Dict[str, Any]],
+    post_profileid_to_name: Optional[Dict[str, str]] = None,
+
+    outfile: Optional[str] = None
+) -> None:
+    """
+    Creates ONE workbook with 2 sheets: PRE and POST.
+    Each sheet uses the same structure as your current export.
+    The DIFF sheet is removed.
+    """
+    if outfile:
+        out_path = outfile
+    else:
+        base = _slug_filename(_network_tag_from_name(network_name))
+        out_path = f"{base}_combined_{timestamp}.xlsx"
+
+    wb = Workbook()
+
+    # PRE sheet
+    ws_pre = wb.active
+    assert ws_pre is not None
+    ws_pre.title = "PRE"
+    _write_snapshot_sheet(
+        ws_pre,
         org_id=org_id,
         network_id=network_id,
         network_name=network_name,
-        template_id=final_tpl_id,
-        vlan_list=final_vlans,
-        mx_list=final_mx,
-        ms_list=final_ms,
-        mr_list=final_mr,
-        profileid_to_name=profileid_to_name,
-        outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_post_{timestamp}.xlsx",
+        template_id=pre_template_id,
+        vlan_list=pre_vlan_list,
+        mx_list=pre_mx_list,
+        ms_list=pre_ms_list,
+        mr_list=pre_mr_list,
+        profileid_to_name=pre_profileid_to_name
     )
+    _autosize(ws_pre)
+
+    # POST sheet
+    ws_post = wb.create_sheet("POST")
+    _write_snapshot_sheet(
+        ws_post,
+        org_id=org_id,
+        network_id=network_id,
+        network_name=network_name,
+        template_id=post_template_id,
+        vlan_list=post_vlan_list,
+        mx_list=post_mx_list,
+        ms_list=post_ms_list,
+        mr_list=post_mr_list,
+        profileid_to_name=post_profileid_to_name
+    )
+    _autosize(ws_post)
+
+    wb.save(out_path)
+    print(f"📗 Combined PRE/POST snapshot exported to: {out_path}")
+    log_change(
+        "snapshot_export_combined",
+        f"Exported combined PRE/POST snapshot (no DIFF) to {out_path}",
+        network_id=network_id,
+        network_name=network_name,
+    )
+
+
+def _network_tag_from_name(name: str) -> str:
+    parts = name.split('-')
+    if len(parts) >= 2 and parts[1].isdigit():
+        return f"{parts[0]}-{parts[1]}"
+    return name
+
+def _network_number_from_name(name: str) -> str | None:
+    m = re.search(r'\b(\d{2,8})\b', name)
+    return m.group(1) if m else None
+
+
+# ======= New extracted helpers to eliminate duplication =======
 
 def maybe_prompt_and_rollback(org_id, network_id, pre_change_devices, pre_change_vlans,
                               pre_change_template, ms_list, network_name,
@@ -1978,19 +2165,7 @@ if __name__ == '__main__':
             logging.exception("Failed fetching old template switch profiles")
 
     # --- Export PRE snapshot ---
-    export_network_snapshot_xlsx(
-        org_id=org_id,
-        network_id=network_id,
-        network_name=network_name,
-        template_id=old_template,
-        vlan_list=pre_change_vlans,
-        mx_list=mx,
-        ms_list=ms,
-        mr_list=mr,
-        profileid_to_name=old_profileid_to_name,
-        outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_pre_{timestamp}.xlsx",
-    )
-
+    
     # -------- MX gate --------
     current_mx_models = sorted({d['model'] for d in mx})
     is_mx64_present = any(m.startswith('MX64') for m in current_mx_models)
@@ -2138,13 +2313,40 @@ if __name__ == '__main__':
         print_summary(step_status)
 
         # --- Export POST snapshot (extracted) ---
-        export_post_snapshot(org_id, network_id, network_name)
-
+        
         # -------- Enhanced rollback prompt (extracted) --------
         post_change_devices = meraki_get(f"/networks/{network_id}/devices")
         post_change_serials = {d['serial'] for d in post_change_devices}
         claimed_serials_rb = list(post_change_serials - pre_change_serials)
         removed_serials_rb = list(pre_change_serials - post_change_serials)
+        # --- Build POST state & export one combined workbook (PATH A) ---
+        final_tpl_id = meraki_get(f"/networks/{network_id}").get('configTemplateId')
+        final_mx, final_ms, final_mr = fetch_devices(org_id, network_id, template_id=final_tpl_id)
+        final_vlans = fetch_vlan_details(network_id)
+        profileid_to_name_post: Dict[str, str] = {}
+        if final_tpl_id:
+            try:
+                final_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{final_tpl_id}/switch/profiles") or []
+                profileid_to_name_post = {p['switchProfileId']: p['name'] for p in final_profiles}
+            except Exception:
+                logging.exception("Failed fetching final template switch profiles")
+
+        export_combined_snapshot_xlsx(
+            org_id=org_id, network_id=network_id, network_name=network_name,
+            pre_template_id=pre_change_template,
+            pre_vlan_list=pre_change_vlans,
+            pre_mx_list=mx,
+            pre_ms_list=ms,
+            pre_mr_list=mr,
+            pre_profileid_to_name=old_profileid_to_name,
+            post_template_id=final_tpl_id,
+            post_vlan_list=final_vlans,
+            post_mx_list=final_mx,
+            post_ms_list=final_ms,
+            post_mr_list=final_mr,
+            post_profileid_to_name=profileid_to_name_post,
+            outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_combined_{timestamp}.xlsx",
+        )
         maybe_prompt_and_rollback(
             org_id, network_id,
             pre_change_devices, pre_change_vlans, pre_change_template,
@@ -2343,8 +2545,35 @@ if __name__ == '__main__':
 
     print_summary(step_status)
 
-    # --- Export POST snapshot (extracted) ---
-    export_post_snapshot(org_id, network_id, network_name)
+    # --- Build POST state & export one combined workbook (PATH A) ---
+    final_tpl_id = meraki_get(f"/networks/{network_id}").get('configTemplateId')
+    final_mx, final_ms, final_mr = fetch_devices(org_id, network_id, template_id=final_tpl_id)
+    final_vlans = fetch_vlan_details(network_id)
+    profileid_to_name_post: Dict[str, str] = {}
+    if final_tpl_id:
+        try:
+            final_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{final_tpl_id}/switch/profiles") or []
+            profileid_to_name_post = {p['switchProfileId']: p['name'] for p in final_profiles}
+        except Exception:
+            logging.exception("Failed fetching final template switch profiles")
+
+    export_combined_snapshot_xlsx(
+        org_id=org_id, network_id=network_id, network_name=network_name,
+        pre_template_id=pre_change_template,
+        pre_vlan_list=pre_change_vlans,
+        pre_mx_list=mx,
+        pre_ms_list=ms,
+        pre_mr_list=mr,
+        pre_profileid_to_name=old_profileid_to_name,
+        post_template_id=final_tpl_id,
+        post_vlan_list=final_vlans,
+        post_mx_list=final_mx,
+        post_ms_list=final_ms,
+        post_mr_list=final_mr,
+        post_profileid_to_name=profileid_to_name_post,
+        outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_combined_{timestamp}.xlsx",
+    )
+
 
     # -------- Enhanced rollback prompt (extracted) --------
     maybe_prompt_and_rollback(
