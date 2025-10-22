@@ -924,20 +924,29 @@ def select_primary_mx(org_id: str, serials: List[str]) -> Optional[str]:
     print("\nMultiple MX devices detected in the claimed list:")
     for idx, (s, m) in enumerate(mx_candidates, 1):
         print(f" {idx}. {s}  ({m})")
-    sel = input("Select which MX should be PRIMARY (mx-01). "
-                "Enter number, or press Enter / type 'skip'/'cancel' to auto-select: ").strip().lower()
 
-    if not sel or sel in {'skip', 'cancel'}:
-        print(f"ℹ️  No explicit choice made. Auto-selecting PRIMARY MX: {auto_choice}")
-        return auto_choice
+    while True:
+        sel = input(
+        "Select which MX should be PRIMARY (mx-01). "
+                "Enter number, or press Enter / type 'skip'/'cancel' to auto-select: "
+        ).strip().lower()
 
-    if sel.isdigit():
-        i = int(sel)
-        if 1 <= i <= len(mx_candidates):
-            return mx_candidates[i-1][0]
+        # Handle skip/cancel/empty
+        if not sel or sel in {'skip', 'cancel'}:
+            print(f"ℹ️  No explicit choice made. Auto-selecting PRIMARY MX: {auto_choice}")
+            return auto_choice
 
-    print(f"ℹ️  Invalid selection. Auto-selecting PRIMARY MX: {auto_choice}")
-    return auto_choice
+        # Validate numeric input
+        if sel.isdigit():
+            i = int(sel)
+            if 1 <= i <= len(mx_candidates):
+                return mx_candidates[i - 1][0]
+            else:
+                print(f"❌ Invalid number. Please choose between 1 and {len(mx_candidates)}.")
+                continue
+
+        # Any other input (e.g., "2,1", "one", etc.)
+        print("❌ Invalid input. Please enter a single number corresponding to an MX device, or press Enter to skip.")
 
 def select_device_order(org_id: str, serials: List[str], kind: str) -> List[str]:
     filtered: List[Tuple[str, str]] = []
