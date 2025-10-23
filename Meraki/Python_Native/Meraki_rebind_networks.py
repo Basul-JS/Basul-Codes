@@ -18,11 +18,10 @@ import os
 import time
 import signal
 import sys
-from typing import Any, Dict, List, Optional, Tuple, Set, Union, Callable
+from typing import Any, Dict, List, Optional, Tuple, Set, Union, Callable, cast
 from openpyxl import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.utils import get_column_letter
-from typing import cast
 import unicodedata
 from difflib import SequenceMatcher  # still used elsewhere for network matching if needed
 
@@ -1258,22 +1257,33 @@ def _pick_template_by_vlan_count(
     templates: List[Dict[str, Any]],
     vlan_count: Optional[int],
 ) -> Optional[Dict[str, Any]]:
-
-    if vlan_count not in (3, 5):
+    """
+    Suggest a template based on VLAN count.
+    - If VLAN count == 3 → match templates named like "NO LEGACY ... MX"
+    - If VLAN count == 5 → match templates named like "3 X DATA VLAN ... MX75"
+    - For all other VLAN counts, no suggestion is made.
+    """
+    if vlan_count is None:
         return None
 
-    patterns: List[str]
+    # Only suggest for VLAN counts 3 or 5
     if vlan_count == 3:
         patterns = [r'NO\s*LEGACY.*MX\b']
-    else:  # vlan_count == 5
+    elif vlan_count == 5:
         patterns = [r'3\s*X\s*DATA[_\s-]*VLAN.*MX75\b']
+    else:
+        # Explicitly do not suggest for other counts (e.g., 4, 6, etc.)
+        return None
 
+    # Try matching pattern(s) against template names
     for pat in patterns:
         rx = re.compile(pat, re.IGNORECASE)
         for t in templates:
             name = (t.get('name') or '')
             if rx.search(name):
                 return t
+
+    # No matches found
     return None
 
 def _current_vlan_count(network_id: str) -> Optional[int]:
