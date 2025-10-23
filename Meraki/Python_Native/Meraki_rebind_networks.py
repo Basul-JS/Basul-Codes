@@ -949,6 +949,13 @@ def select_primary_mx(org_id: str, serials: List[str]) -> Optional[str]:
         print("❌ Invalid input. Please enter a single number corresponding to an MX device, or press Enter to skip.")
 
 def select_device_order(org_id: str, serials: List[str], kind: str) -> List[str]:
+    """
+    Ask for an order of devices of a given kind (MR/MS).
+    - Accepts partial input: e.g., '2,1' when there are 3 items.
+    - Orders the selected indices first (in the specified order),
+      then appends any remaining devices in their original order.
+    - Enter/skip/cancel => auto-order by serial.
+    """
     filtered: List[Tuple[str, str]] = []
     for s in serials:
         try:
@@ -961,27 +968,54 @@ def select_device_order(org_id: str, serials: List[str], kind: str) -> List[str]
         except Exception:
             logging.exception(f"Unable to read inventory for {s}")
 
+    # If 0 or 1 device, nothing to order
     if len(filtered) <= 1:
         return [s for s, _ in filtered]
 
-    auto_order = sorted([s for s, _ in filtered])
+    # Default auto order
+    auto_order = [s for s, _ in filtered]  # keep original order shown to user
 
+    # Show menu
     print(f"\nSelect ordering for {kind} devices (enter a comma-separated list of indices).")
     for idx, (s, m) in enumerate(filtered, 1):
         print(f" {idx}. {s}  ({m})")
-    raw = input(f"Desired order for {kind} (e.g. 2,1,3). "
-                "Press Enter / type 'skip'/'cancel' to auto-order: ").strip().lower()
 
+    raw = input(
+        f"Desired order for {kind} (e.g. 2,1,3). "
+        "Press Enter / type 'skip'/'cancel' to auto-order: "
+    ).strip().lower()
+
+    # Auto-order on skip
     if not raw or raw in {'skip', 'cancel'}:
-        print(f"ℹ️  Auto-ordering {kind} devices by serial: {', '.join(auto_order)}")
+        print(f"ℹ️  Auto-ordering {kind} devices (original order): {', '.join(auto_order)}")
         return auto_order
 
+    # Parse indices; accept partial sets
     parts = [p.strip() for p in raw.split(',') if p.strip()]
-    if all(p.isdigit() and 1 <= int(p) <= len(filtered) for p in parts) and len(parts) == len(filtered):
-        return [filtered[int(p)-1][0] for p in parts]
+    valid_indices: List[int] = []
+    seen: set[int] = set()
+    for p in parts:
+        if not p.isdigit():
+            print(f"❌ '{p}' is not a number. Please enter indices like 2,1,3.")
+            # re-prompt
+            return select_device_order(org_id, serials, kind)
+        i = int(p)
+        if not (1 <= i <= len(filtered)):
+            print(f"❌ {i} is out of range. Valid range is 1..{len(filtered)}.")
+            return select_device_order(org_id, serials, kind)
+        if i in seen:
+            print(f"❌ Duplicate index {i} detected.")
+            return select_device_order(org_id, serials, kind)
+        seen.add(i)
+        valid_indices.append(i)
 
-    print(f"ℹ️  Invalid list. Auto-ordering {kind} devices by serial: {', '.join(auto_order)}")
-    return auto_order
+    # Build final order: chosen first (in specified order), then remaining in original order
+    chosen_serials = [filtered[i - 1][0] for i in valid_indices]
+    remaining_serials = [s for s, _ in filtered if s not in chosen_serials]
+    final_order = chosen_serials + remaining_serials
+
+    print(f"✅ Using {kind} order: {', '.join(final_order)}")
+    return final_order
 
 # ---------- Warm spare primary enforcement ----------
 def ensure_primary_mx(network_id: str, desired_primary_serial: Optional[str]) -> None:
@@ -1249,84 +1283,55 @@ def _current_vlan_count(network_id: str) -> Optional[int]:
 # Simple in-memory cache so we don't recount the same template over and over
 _TEMPLATE_COUNT_CACHE: Dict[str, int] = {}
 
+# Simple in-memory cache so we don't recount the same template over and over
+_TEMPLATE_COUNT_CACHE: Dict[str, int] = {}
+
 def _count_networks_bound_to_template(org_id: str, template_id: str) -> int:
     """
-    Returns how many networks are bound to a given config template.
+    Returns how many networks are bound to a given config template by scanning
+    /organizations/{orgId}/networks (paginated) and counting matches where
+    network['configTemplateId'] == template_id.
 
-    Primary:  GET /organizations/{orgId}/configTemplates/{templateId}/networks (paginated)
-    Fallback: GET /organizations/{orgId}/networks (paginated) and count where
-              network['configTemplateId'] == template_id
+    We intentionally avoid the template-specific endpoint because it is
+    unreliable or unavailable in some orgs (e.g., 403/404).
     """
     if not template_id:
         return 0
-    if template_id in _TEMPLATE_COUNT_CACHE :
+    if template_id in _TEMPLATE_COUNT_CACHE:
         return _TEMPLATE_COUNT_CACHE[template_id]
 
-    def _primary_count() -> int:
-        total = 0
-        per_page = 1000
-        starting_after: Optional[str] = None
-        while True:
-            params: Dict[str, Any] = {"perPage": per_page}
-            if starting_after:
-                params["startingAfter"] = starting_after
-            page_raw: Any = meraki_get(
-                f"/organizations/{org_id}/configTemplates/{template_id}/networks",
-                params=params
-            )
-            page: List[Dict[str, Any]] = page_raw if isinstance(page_raw, list) else []
-            if not page:
-                break
-            total += len(page)
-            if len(page) < per_page:
-                break
-            last = page[-1]
-            starting_after = str(last.get("id") or last.get("networkId") or last.get("name") or "")
-            if not starting_after:
-                break
-        return total
+    total = 0
+    per_page = 1000
+    starting_after: Optional[str] = None
 
-    def _fallback_count() -> int:
-        total = 0
-        per_page = 1000
-        starting_after: Optional[str] = None
+    try:
         while True:
             params: Dict[str, Any] = {"perPage": per_page}
             if starting_after:
                 params["startingAfter"] = starting_after
+
             page_raw: Any = meraki_get(f"/organizations/{org_id}/networks", params=params)
             page: List[Dict[str, Any]] = page_raw if isinstance(page_raw, list) else []
             if not page:
                 break
-            # Count only those bound to this template
+
+            # Count only networks bound to this template
             total += sum(1 for n in page if (n.get("configTemplateId") == template_id))
+
             if len(page) < per_page:
                 break
+
             last = page[-1]
             starting_after = str(last.get("id") or "")
             if not starting_after:
                 break
-        return total
 
-    try:
-        count = _primary_count()
-    except MerakiAPIError as e:
-        # Typical: 404 Not Found or 403 Forbidden -> use fallback
-        if e.status_code in (403, 404):
-            logging.warning(
-                "Primary count endpoint unavailable for template %s (HTTP %s). Falling back to org networks scan.",
-                template_id, e.status_code
-            )
-            count = _fallback_count()
-        else:
-            logging.exception("Primary count failed for template %s; using fallback.", template_id)
-            count = _fallback_count()
     except Exception:
-        logging.exception("Primary count raised unexpected error for template %s; using fallback.", template_id)
-        count = _fallback_count()
+        logging.exception("Fallback count failed for template %s; returning 0.", template_id)
+        total = 0
 
-    _TEMPLATE_COUNT_CACHE[template_id] = count
-    return count
+    _TEMPLATE_COUNT_CACHE[template_id] = total
+    return total
 
 
 # ---------- Template rebind helpers (with rollback) ----------
@@ -1409,6 +1414,27 @@ def list_and_rebind_template(
 
     # --- Selection loop ---
     while True:
+        print(f"\nCurrent network: {network_name} (ID: {network_id})")
+        log_change('current_network_info', f"Current network: {network_name}",
+                org_id=org_id, network_id=network_id, network_name=network_name)
+
+        # Show current bound template (if any)
+        if current_id:
+            try:
+                curr = meraki_get(f"/organizations/{org_id}/configTemplates/{current_id}")
+                curr_name = curr.get('name', '<unknown>')
+                print(f"Bound template: {curr_name} (ID: {current_id})\n")
+                log_change('bound_template_info',
+                        f"Bound template {curr_name} ({current_id})",
+                        network_id=network_id, network_name=network_name)
+            except Exception:
+                print(f"Bound template ID: {current_id}\n")
+                log_change('bound_template_info',
+                        f"Bound template ID: {current_id}",
+                        network_id=network_id, network_name=network_name)
+        else:
+            print("No template bound.\n")
+
         print("Available templates (< 90 bound or unknown):")
         for i, t in enumerate(filtered, 1):
             name = t.get('name', '')
@@ -1421,7 +1447,7 @@ def list_and_rebind_template(
         if suggested_tpl:
             print(f"\nSuggestion: Based on VLAN count ({vlan_count}), '{suggested_tpl.get('name')}' looks appropriate.")
             print("Press 'a' to auto-select the suggested template, or choose a number. "
-                  "Press Enter / type 'skip'/'cancel' to cancel (twice cancels with rollback).")
+                "Press Enter / type 'skip'/'cancel' to cancel (twice cancels with rollback).")
 
         sel = input("Select template # (or 'a' to accept suggestion): ").strip().lower()
 
@@ -1467,8 +1493,8 @@ def list_and_rebind_template(
                 do_action(meraki_post, f"/networks/{network_id}/unbind")
             do_action(meraki_post, f"/networks/{network_id}/bind", data={"configTemplateId": chosen['id']})
             log_change('template_bind',
-                       f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
-                       device_name=network_name, network_id=network_id, network_name=network_name)
+                    f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
+                    device_name=network_name, network_id=network_id, network_name=network_name)
             print(f"✅ Bound to {chosen.get('name')}")
             return chosen['id'], chosen.get('name'), False
 
