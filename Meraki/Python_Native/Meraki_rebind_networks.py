@@ -1645,26 +1645,65 @@ def rollback_all_changes(
     ms_list: Optional[List[Dict[str, Any]]] = None,
     network_name: str,
 ):
+    """
+    Roll back safely:
+      - Only REMOVE devices that were ADDED during this run (not present pre-change).
+      - Never remove MG (cellular gateway) unless it was added during this run.
+      - Only RE-ADD devices that were present pre-change and are now missing.
+    """
     print("=== Starting rollback to previous network state ===")
 
-    if claimed_serials:
-        for serial in claimed_serials:
+    # Build quick lookup sets/maps from pre-change state
+    pre_serials: Set[str] = {d.get("serial", "") for d in pre_change_devices if d.get("serial")}
+    pre_by_serial: Dict[str, Dict[str, Any]] = {d["serial"]: d for d in pre_change_devices if d.get("serial")}
+
+    # --- Stage 1: Remove devices that were added during this run ---
+    # A device is eligible for removal iff:
+    #   - present in 'claimed_serials' (as given by the workflow)
+    #   - NOT in 'pre_serials' (i.e., it wasn't there pre-change)
+    #   - and is still currently in this network (best-effort check)
+    #   - skip MG unless explicitly added (claim list) and not in pre
+    safe_claimed = list(claimed_serials or [])
+    if safe_claimed:
+        try:
+            current_devices = meraki_get(f"/networks/{network_id}/devices") or []
+            current_serials = {d.get("serial") for d in current_devices if d.get("serial")}
+        except Exception:
+            logging.exception("Failed to fetch current devices during rollback; proceeding with cautious removals")
+            current_serials = set()
+
+        for serial in safe_claimed:
+            if not serial:
+                continue
+            # Only remove if it was NOT in pre-change snapshot (i.e., added by this run)
+            if serial in pre_serials:
+                continue
+            # Only remove if it's currently in the network (when known)
+            if current_serials and serial not in current_serials:
+                continue
+
+            # Skip MG (cellular gateway) unless it was added by this run (which we already assert above)
+            # Here we still double-check the model to avoid surprises.
+            try:
+                inv = get_inventory_device(org_id, serial) or {}
+                model = (inv.get("model") or "").upper()
+                if model.startswith("MG"):
+                    # We skip MG removal to avoid touching existing WAN failover gear.
+                    logging.info("Rollback: skipping removal of MG device %s (model %s)", serial, model)
+                    continue
+            except Exception:
+                # On inventory failure, play it safe: do not remove unless we’re very sure it was added by us
+                logging.exception("Inventory check failed for %s during rollback removal; skipping removal", serial)
+                continue
+
             print(f"Removing claimed device: {serial}")
             try:
                 do_action(meraki_post, f"/networks/{network_id}/devices/remove", data={"serial": serial})
-                log_change('rollback_device_removed', f"Removed claimed device in rollback", device_serial=serial)
+                log_change('rollback_device_removed', "Removed device added during this run", device_serial=serial)
             except Exception:
-                logging.exception(f"Failed to remove claimed device {serial}")
+                logging.exception("Failed to remove claimed device %s during rollback", serial)
 
-    if removed_serials:
-        for serial in removed_serials:
-            print(f"Re-adding previously removed device: {serial}")
-            try:
-                do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": [serial]})
-                log_change('rollback_device_reclaimed', f"Re-claimed previously removed device", device_serial=serial)
-            except Exception:
-                logging.exception(f"Failed to re-claim device {serial}")
-
+    # --- Stage 2: Restore original template binding ---
     print("Restoring config template binding...")
     try:
         do_action(meraki_post, f"/networks/{network_id}/unbind")
@@ -1677,73 +1716,101 @@ def rollback_all_changes(
     print("Waiting for template binding to take effect (sleeping 15 seconds)...")
     time.sleep(15)
 
-    current_devices = meraki_get(f"/networks/{network_id}/devices")
-    current_serials = {d['serial'] for d in current_devices}
-    for dev in pre_change_devices:
-        if dev["serial"] not in current_serials:
-            try:
-                inv = get_inventory_device(org_id, dev['serial'])
-                if not inv.get('networkId'):
-                    print(f"Re-adding device {dev['serial']} ({dev['model']}) to network...")
-                    do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": [dev["serial"]]})
-                    log_change('rollback_device_readded', f"Device re-added during rollback", device_serial=dev['serial'])
-                else:
-                    print(f"Device {dev['serial']} is assigned elsewhere. Skipping.")
-            except Exception as e:
-                print(f"Could not check/claim device {dev['serial']}: {e}")
+    # --- Stage 3: Re-add devices that were present pre-change but are now missing ---
+    try:
+        current_devices = meraki_get(f"/networks/{network_id}/devices") or []
+        current_serials = {d.get("serial") for d in current_devices if d.get("serial")}
+    except Exception:
+        logging.exception("Failed to fetch current devices after template bind in rollback")
+        current_devices = []
+        current_serials = set()
 
-    current_devices = meraki_get(f"/networks/{network_id}/devices")
-    current_serials = {d['serial'] for d in current_devices}
+    # Optionally trust 'removed_serials' if provided, but also scan pre_change_devices to be robust
+    # Only re-add if:
+    #   - the device was in pre_serials
+    #   - currently not in the network
+    #   - and not assigned elsewhere
+    for serial in sorted(pre_serials - current_serials):
+        if not serial:
+            continue
+        try:
+            inv = get_inventory_device(org_id, serial)
+            if inv.get('networkId'):
+                print(f"Device {serial} is currently assigned to another network. Skipping re-add.")
+                continue
+            print(f"Re-adding previously present device: {serial}")
+            do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": [serial]})
+            log_change('rollback_device_readded', "Device re-added during rollback", device_serial=serial)
+        except Exception as e:
+            print(f"Could not check/claim device {serial}: {e}")
 
+    # Re-fetch after re-adding to apply per-device settings
+    try:
+        current_devices = meraki_get(f"/networks/{network_id}/devices") or []
+        current_serials = {d.get("serial") for d in current_devices if d.get("serial")}
+    except Exception:
+        logging.exception("Failed to fetch current devices (post re-add) during rollback")
+        current_devices = []
+        current_serials = set()
+
+    # Fetch switch profiles for restored template (to re-map MS profiles by id/name)
     try:
         restored_tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{pre_change_template}/switch/profiles") if pre_change_template else []
-        profile_id_set = {p['switchProfileId'] for p in restored_tpl_profiles}
-        profile_name_to_id = {p['name']: p['switchProfileId'] for p in restored_tpl_profiles}
+        profile_id_set = {p['switchProfileId'] for p in (restored_tpl_profiles or [])}
+        profile_name_to_id = {p['name']: p['switchProfileId'] for p in (restored_tpl_profiles or [])}
     except Exception:
-        logging.exception("Could not fetch switch profiles for restored template")
+        logging.exception("Could not fetch switch profiles for restored template (rollback)")
         restored_tpl_profiles = []
         profile_id_set = set()
         profile_name_to_id = {}
 
-    for dev in pre_change_devices:
-        if dev["serial"] not in current_serials:
+    # Restore device metadata (name/address/tags) and MS switchProfileId + port overrides
+    for serial, dev in pre_by_serial.items():
+        if serial not in current_serials:
             continue
 
-        update_args: Dict[str, Any] = {"name": dev.get("name", ""), "address": dev.get("address", ""), "tags": dev.get("tags", [])}
-        if dev["model"].startswith("MS"):
-            serial = dev["serial"]
+        update_args: Dict[str, Any] = {
+            "name": dev.get("name", ""),
+            "address": dev.get("address", ""),
+            "tags": dev.get("tags", []) if isinstance(dev.get("tags"), list) else (dev.get("tags") or "").split(),
+        }
+
+        # MS profile restoration
+        if str(dev.get("model", "")).upper().startswith("MS"):
             orig_profile_id = dev.get('switchProfileId')
             if orig_profile_id and orig_profile_id in profile_id_set:
                 print(f"Auto-restoring MS {serial} to profile ID {orig_profile_id}")
                 update_args["switchProfileId"] = orig_profile_id
             else:
                 orig_profile_name = dev.get('switchProfileName')
-                new_profile_id = profile_name_to_id.get(orig_profile_name)
+                new_profile_id = profile_name_to_id.get(orig_profile_name) if orig_profile_name else None
                 if new_profile_id:
                     print(f"Auto-restoring MS {serial} to profile '{orig_profile_name}' (ID: {new_profile_id})")
                     update_args["switchProfileId"] = new_profile_id
 
         try:
-            do_action(meraki_put, f"/devices/{dev['serial']}", data=update_args)
+            do_action(meraki_put, f"/devices/{serial}", data=update_args)
             log_change(
                 'rollback_device_update',
-                f"Restored device config during rollback",
-                device_serial=dev['serial'],
+                "Restored device config during rollback",
+                device_serial=serial,
                 device_name=dev.get('name', ''),
                 misc=f"tags={dev.get('tags', [])}, address={dev.get('address', '')}"
             )
         except Exception:
-            logging.exception(f"Failed to update device {dev['serial']} during rollback")
+            logging.exception("Failed to update device %s during rollback", serial)
             continue
 
-        if dev["model"].startswith("MS"):
+        # Re-apply preserved MS port overrides, if any
+        if str(dev.get("model", "")).upper().startswith("MS"):
             try:
                 preserved = (dev.get('port_overrides') or {})
                 if preserved:
-                    apply_port_overrides(dev['serial'], preserved)
+                    apply_port_overrides(serial, preserved)
             except Exception:
-                logging.exception(f"Failed applying preserved port overrides during rollback for {dev['serial']}")
+                logging.exception("Failed applying preserved port overrides during rollback for %s", serial)
 
+    # --- Stage 4: Restore VLANs and DHCP assignments ---
     print("Restoring VLANs and DHCP assignments...")
     time.sleep(5)
     update_vlans(network_id, network_name, pre_change_vlans)
