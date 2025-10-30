@@ -5,7 +5,8 @@
 # 20251001 - paginated getter for networks
 # 20251001 - update dhcp handling logic to be more robust
 # 20251020 - update to to list the number of networks bound to each template and only lists templates that have less than 90 networks bound
-
+# 20251028 - tighthen the template selection logic to more accurately return templates relevant to the current network/template
+# 20251028 - removed redundant and unsed functions
 
 import requests
 import logging
@@ -81,6 +82,64 @@ def log_change(
             network_id or '',
             network_name or ''
         ])
+        
+# ---- Caches to avoid repeated org-wide scans (reduces 429s) ----
+_ORG_NETWORKS_CACHE: Dict[str, Dict[str, Any]] = {}
+# shape: { org_id: {"expires": float_epoch, "networks": List[Dict[str, Any]]} }
+
+_TEMPLATE_COUNT_CACHE: Dict[str, Dict[str, int]] = {}
+# shape: { org_id: { template_id: count, ... } }
+
+def _get_org_networks_cached(org_id: str, ttl_seconds: int = 120) -> List[Dict[str, Any]]:
+    """
+    Fetch all org networks once (paginated), cache for ttl_seconds to avoid 429s.
+    """
+    now = time.time()
+    cached = _ORG_NETWORKS_CACHE.get(org_id)
+    if cached and cached.get("expires", 0) > now:
+        return cast(List[Dict[str, Any]], cached.get("networks", []))
+
+    nets: List[Dict[str, Any]] = []
+    per_page = 1000
+    starting_after: Optional[str] = None
+    while True:
+        params: Dict[str, Any] = {"perPage": per_page}
+        if starting_after:
+            params["startingAfter"] = starting_after
+        page_raw: Any = meraki_get(f"/organizations/{org_id}/networks", params=params)
+        page: List[Dict[str, Any]] = page_raw if isinstance(page_raw, list) else []
+        if not page:
+            break
+        nets.extend(page)
+        if len(page) < per_page:
+            break
+        last = page[-1]
+        starting_after = str(last.get("id") or "")
+        if not starting_after:
+            break
+
+    _ORG_NETWORKS_CACHE[org_id] = {"expires": now + ttl_seconds, "networks": nets}
+    return nets
+
+def _template_counts_for_org(org_id: str) -> Dict[str, int]:
+    """
+    Compute counts for ALL templates by scanning org networks once.
+    Cached per org_id; invalidate when needed by clearing the org entry.
+    """
+    cached = _TEMPLATE_COUNT_CACHE.get(org_id)
+    if cached is not None:
+        return cached
+
+    nets = _get_org_networks_cached(org_id)
+    counts: Dict[str, int] = {}
+    for n in nets:
+        tpl_id = n.get("configTemplateId")
+        if tpl_id:
+            counts[tpl_id] = counts.get(tpl_id, 0) + 1
+
+    _TEMPLATE_COUNT_CACHE[org_id] = counts
+    return counts
+
 
 # =====================
 # Prompts
@@ -471,33 +530,10 @@ def apply_port_overrides(serial: str, overrides: Dict[str, Dict[str, Any]]) -> N
 # =====================
 # Domain helpers (raw API)
 # =====================
+
 def meraki_list_networks_all(org_id: str) -> List[Dict[str, Any]]:
-    all_nets: List[Dict[str, Any]] = []
-    per_page: int = 1000
-    starting_after: Optional[str] = None
-
-    while True:
-        params: Dict[str, Any] = {"perPage": per_page}
-        if starting_after:
-            params["startingAfter"] = starting_after
-
-        page_raw: Any = meraki_get(f"/organizations/{org_id}/networks", params=params)
-        page: List[Dict[str, Any]] = page_raw if isinstance(page_raw, list) else []
-
-        if not page:
-            break
-
-        all_nets.extend(page)
-
-        if len(page) < per_page:
-            break
-
-        last = page[-1]
-        starting_after = str(last.get("id") or "")
-        if not starting_after:
-            break
-
-    return all_nets
+    # Prefer the cached scan to avoid re-paginating during the same run
+    return list(_get_org_networks_cached(org_id))
 
 def _norm(s: Optional[str]) -> str:
     base: str = s or ""
@@ -1258,91 +1294,38 @@ def _pick_template_by_vlan_count(
     vlan_count: Optional[int],
 ) -> Optional[Dict[str, Any]]:
     """
-    Suggest a template based on VLAN count.
-    - If VLAN count == 3 → match templates named like "NO LEGACY ... MX"
-    - If VLAN count == 5 → match templates named like "3 X DATA VLAN ... MX75"
-    - For all other VLAN counts, no suggestion is made.
+    Suggest a template based on VLAN count:
+      - 3 VLANs  -> match name like 'NO LEGACY ... MX' or '... MX67/MX75'
+      - 5 VLANs  -> match name like '3 X DATA VLAN ... MX75'
+      - 4 VLANs  -> NO SUGGESTION (returns None)
+      - other    -> raise ValueError so the caller can warn the user
     """
     if vlan_count is None:
         return None
 
-    # Only suggest for VLAN counts 3 or 5
     if vlan_count == 3:
-        patterns = [r'NO\s*LEGACY.*MX\b']
+        patterns = [r'NO\s*LEGACY.*MX(?:\d{2})?\b']
     elif vlan_count == 5:
         patterns = [r'3\s*X\s*DATA[_\s-]*VLAN.*MX75\b']
-    else:
-        # Explicitly do not suggest for other counts (e.g., 4, 6, etc.)
+    elif vlan_count == 4:
+        # Explicitly do NOT suggest any template for 4 VLANs
         return None
+    else:
+        raise ValueError(
+            "Incorrect number of VLANs detected in the current network. "
+            "Please double check the selected network."
+        )
 
-    # Try matching pattern(s) against template names
-    for pat in patterns:
-        rx = re.compile(pat, re.IGNORECASE)
-        for t in templates:
-            name = (t.get('name') or '')
-            if rx.search(name):
-                return t
-
-    # No matches found
+    for t in templates:
+        name = (t.get('name') or '')
+        if any(re.search(pat, name, re.IGNORECASE) for pat in patterns):
+            return t
     return None
+
 
 def _current_vlan_count(network_id: str) -> Optional[int]:
     vlans = fetch_vlan_details(network_id)
     return len(vlans) if isinstance(vlans, list) else None
-
-# Simple in-memory cache so we don't recount the same template over and over
-_TEMPLATE_COUNT_CACHE: Dict[str, int] = {}
-
-# Simple in-memory cache so we don't recount the same template over and over
-_TEMPLATE_COUNT_CACHE: Dict[str, int] = {}
-
-def _count_networks_bound_to_template(org_id: str, template_id: str) -> int:
-    """
-    Returns how many networks are bound to a given config template by scanning
-    /organizations/{orgId}/networks (paginated) and counting matches where
-    network['configTemplateId'] == template_id.
-
-    We intentionally avoid the template-specific endpoint because it is
-    unreliable or unavailable in some orgs (e.g., 403/404).
-    """
-    if not template_id:
-        return 0
-    if template_id in _TEMPLATE_COUNT_CACHE:
-        return _TEMPLATE_COUNT_CACHE[template_id]
-
-    total = 0
-    per_page = 1000
-    starting_after: Optional[str] = None
-
-    try:
-        while True:
-            params: Dict[str, Any] = {"perPage": per_page}
-            if starting_after:
-                params["startingAfter"] = starting_after
-
-            page_raw: Any = meraki_get(f"/organizations/{org_id}/networks", params=params)
-            page: List[Dict[str, Any]] = page_raw if isinstance(page_raw, list) else []
-            if not page:
-                break
-
-            # Count only networks bound to this template
-            total += sum(1 for n in page if (n.get("configTemplateId") == template_id))
-
-            if len(page) < per_page:
-                break
-
-            last = page[-1]
-            starting_after = str(last.get("id") or "")
-            if not starting_after:
-                break
-
-    except Exception:
-        logging.exception("Fallback count failed for template %s; returning 0.", template_id)
-        total = 0
-
-    _TEMPLATE_COUNT_CACHE[template_id] = total
-    return total
-
 
 # ---------- Template rebind helpers (with rollback) ----------
 def list_and_rebind_template(
@@ -1371,23 +1354,26 @@ def list_and_rebind_template(
     all_templates_raw: Any = meraki_get(f"/organizations/{org_id}/configTemplates")
     all_templates: List[Dict[str, Any]] = all_templates_raw if isinstance(all_templates_raw, list) else []
 
-    # Count networks bound per template and filter to < 90
+    # Pre-compute all counts once (fast lookup for each template)
+    all_counts = _template_counts_for_org(org_id)
+
     eligible: List[Dict[str, Any]] = []   # known counts < 90
-    unknown: List[Dict[str, Any]] = []    # count failed; include as unknown so user can still proceed
+    unknown: List[Dict[str, Any]] = []    # templates without a count (unlikely), keep as unknown
 
     for t in all_templates:
         tid = t.get("id")
         if not tid:
             continue
-        try:
-            bound_count = _count_networks_bound_to_template(org_id, tid)
-            t2 = dict(t); t2["_boundCount"] = bound_count  # int
-            if bound_count < 90:
-                eligible.append(t2)
-        except Exception:
-            logging.exception("Failed to compute bound count for template %s; including as unknown.", tid)
-            t2 = dict(t); t2["_boundCount"] = None         # unknown
+
+        bound_count = all_counts.get(tid)
+        if bound_count is None:
+            t2 = dict(t); t2["_boundCount"] = None
             unknown.append(t2)
+            continue
+
+        if bound_count < 90:
+            t2 = dict(t); t2["_boundCount"] = bound_count
+            eligible.append(t2)
 
     # If we have no eligible ones, fall back to unknown list (so the menu isn't empty)
     if not eligible and not unknown:
@@ -1401,10 +1387,6 @@ def list_and_rebind_template(
         # Prefer eligible (<90), but also append unknown so you still have options
         filtered = eligible + unknown
 
-        # Keep existing VLAN-count suggestion logic
-    vlan_count: Optional[int] = _current_vlan_count(network_id)
-    suggested_tpl: Optional[Dict[str, Any]] = _pick_template_by_vlan_count(filtered, vlan_count)
-
     # Optional model suffix filter (MX67/MX75) over the already filtered list
     if mx_model_filter in {'MX67', 'MX75'}:
         suffix = mx_model_filter.upper()
@@ -1413,6 +1395,30 @@ def list_and_rebind_template(
             filtered = subset
         else:
             print(f"(No templates ending with {suffix} in the current list; showing all eligible/unknown templates instead.)")
+
+    # VLAN-based filtering/suggestion
+    vlan_count: Optional[int] = _current_vlan_count(network_id)
+
+    # If VLAN count is exactly 4, exclude names matching the 3/5-VLAN patterns
+    if vlan_count == 4:
+        rx_no_legacy_mx = re.compile(r'NO\s*LEGACY.*MX(?:\d{2})?\b', re.IGNORECASE)
+        rx_3xdata_mx75 = re.compile(r'3\s*X\s*DATA[_\s-]*VLAN.*MX75\b', re.IGNORECASE)
+        filtered = [
+            t for t in filtered
+            if not rx_no_legacy_mx.search(t.get('name') or '')
+            and not rx_3xdata_mx75.search(t.get('name') or '')
+        ]
+        if not filtered:
+            print("⚠️ No templates left after excluding 3/5-VLAN patterns for a 4-VLAN network.")
+            # Nothing to pick from; bail out without changing template.
+            return current_id, None, False
+
+    # Now compute the suggestion against the final filtered list
+    try:
+        suggested_tpl: Optional[Dict[str, Any]] = _pick_template_by_vlan_count(filtered, vlan_count)
+    except ValueError as e:
+        print(f"❌ {e}")
+        suggested_tpl = None
 
     # Bubble the suggestion to the top if present in the filtered set
     suggested_id: Optional[str] = suggested_tpl.get('id') if suggested_tpl else None
@@ -1502,6 +1508,10 @@ def list_and_rebind_template(
             if current_id:
                 do_action(meraki_post, f"/networks/{network_id}/unbind")
             do_action(meraki_post, f"/networks/{network_id}/bind", data={"configTemplateId": chosen['id']})
+            # Invalidate org-level caches after a (re)bind, so later views are fresh
+            _ORG_NETWORKS_CACHE.pop(org_id, None)
+            _TEMPLATE_COUNT_CACHE.pop(org_id, None)
+
             log_change('template_bind',
                     f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
                     device_name=network_name, network_id=network_id, network_name=network_name)
@@ -1878,28 +1888,6 @@ def _autosize(ws):
                     max_len = len(s)
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
 
-def _dict_by_key(items: List[Dict[str, Any]], key: str) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for it in items:
-        k = it.get(key)
-        if k is not None:
-            out[str(k)] = it
-    return out
-
-def _device_dict_by_serial(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return _dict_by_key(items, "serial")
-
-def _ms_port_overrides_map(ms_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for sw in ms_list:
-        serial = sw.get("serial")
-        if not serial:
-            continue
-        po = sw.get("port_overrides") or {}
-        if isinstance(po, dict):
-            out[str(serial)] = po
-    return out
-
 def _write_snapshot_sheet(
     ws,
     *,
@@ -1987,18 +1975,6 @@ def _write_snapshot_sheet(
                     _json(val) if isinstance(val, (dict, list)) else "",
                 ])
 
-def _add_diff_row(ws, section: str, item: str, sub_item: str, field: str, pre, post, note: str = ""):
-    ws.append([
-        section, item, sub_item, field,
-        "" if isinstance(pre, (dict, list)) else str(pre),
-        "" if isinstance(post, (dict, list)) else str(post),
-        _json(pre) if isinstance(pre, (dict, list)) else "",
-        _json(post) if isinstance(post, (dict, list)) else "",
-        note
-    ])
-
-
-
 def export_combined_snapshot_xlsx(
     *,
     org_id: str,
@@ -2085,11 +2061,6 @@ def _network_tag_from_name(name: str) -> str:
     if len(parts) >= 2 and parts[1].isdigit():
         return f"{parts[0]}-{parts[1]}"
     return name
-
-def _network_number_from_name(name: str) -> str | None:
-    m = re.search(r'\b(\d{2,8})\b', name)
-    return m.group(1) if m else None
-
 
 # ======= New extracted helpers to eliminate duplication =======
 
