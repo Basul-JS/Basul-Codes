@@ -559,15 +559,29 @@ def fetch_devices(
     network_id: str,
     template_id: Optional[str] = None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    devs = meraki_get(f"/networks/{network_id}/devices")
+    """
+    Returns (mx_list, ms_list, mr_list). Never returns None on any path.
+    """
+    # 1) Get devices (robust against None / non-list / exceptions)
+    try:
+        raw = meraki_get(f"/networks/{network_id}/devices")
+    except Exception:
+        logging.exception("Failed to fetch devices for network %s", network_id)
+        raw = None
 
-    def _mk(d):
+    devs: List[Dict[str, Any]] = raw if isinstance(raw, list) else []
+    if raw is None:
+        logging.warning("devices endpoint returned None for network %s; treating as empty list", network_id)
+
+    # 2) Normalizer
+    def _mk(d: Dict[str, Any]) -> Dict[str, Any]:
+        model = str(d.get('model', '') or '')
         tags = d.get('tags', [])
         if not isinstance(tags, list):
-            tags = (tags or '').split()
+            tags = (str(tags) or '').split()
         return {
-            'serial': d['serial'],
-            'model': d['model'],
+            'serial': d.get('serial', ''),
+            'model': model,
             'tags': tags,
             'address': d.get('address', ''),
             'name': d.get('name', ''),
@@ -575,10 +589,12 @@ def fetch_devices(
             'switchProfileName': d.get('switchProfileName'),
         }
 
-    mx = [_mk(d) for d in devs if d['model'].startswith('MX')]
-    ms = [_mk(d) for d in devs if d['model'].startswith('MS')]
-    mr = [_mk(d) for d in devs if _is_wireless_model(d.get('model'))]
+    # 3) Split by product type (safe for missing model)
+    mx: List[Dict[str, Any]] = [_mk(d) for d in devs if str(d.get('model', '')).startswith('MX')]
+    ms: List[Dict[str, Any]] = [_mk(d) for d in devs if str(d.get('model', '')).startswith('MS')]
+    mr: List[Dict[str, Any]] = [_mk(d) for d in devs if _is_wireless_model(str(d.get('model', '')))]
 
+    # 4) Compute MS port overrides if we have a template_id
     if template_id:
         for sw in ms:
             profile_id = sw.get('switchProfileId')
@@ -586,26 +602,30 @@ def fetch_devices(
                 sw['port_overrides'] = {}
                 continue
             try:
-                live_ports = meraki_get(f"/devices/{sw['serial']}/switch/ports")
-                tmpl_ports = meraki_get(
+                live_ports_raw = meraki_get(f"/devices/{sw['serial']}/switch/ports")
+                tmpl_ports_raw = meraki_get(
                     f"/organizations/{org_id}/configTemplates/{template_id}/switch/profiles/{profile_id}/ports"
                 )
+                live_ports: List[Dict[str, Any]] = live_ports_raw if isinstance(live_ports_raw, list) else []
+                tmpl_ports: List[Dict[str, Any]] = tmpl_ports_raw if isinstance(tmpl_ports_raw, list) else []
                 sw['port_overrides'] = compute_port_overrides(live_ports, tmpl_ports)
-                logging.debug(f"Computed {len(sw['port_overrides'])} port overrides for {sw['serial']}")
+                logging.debug("Computed %d port overrides for %s", len(sw['port_overrides']), sw['serial'])
             except Exception:
-                logging.exception(f"Failed computing port overrides for {sw['serial']}")
+                logging.exception("Failed computing port overrides for %s", sw.get('serial') or '<unknown>')
                 sw['port_overrides'] = {}
     else:
         for sw in ms:
             sw['port_overrides'] = {}
 
-    logging.debug(f"Fetched devices: MX={len(mx)}, MS={len(ms)}, MR={len(mr)}")
+    logging.debug("Fetched devices: MX=%d, MS=%d, MR=%d", len(mx), len(ms), len(mr))
     log_change(
         event='fetch_devices',
         details=f"Fetched devices for network {network_id}",
         network_id=network_id,
         misc=f"mx={json.dumps(mx)}, ms={json.dumps(ms)}, mr={json.dumps(mr)}"
     )
+
+    # 5) ALWAYS return the triple
     return mx, ms, mr
 
 def fetch_vlan_details(network_id: str) -> List[Dict[str, Any]]:
