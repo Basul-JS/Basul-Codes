@@ -7,6 +7,9 @@
 # 20251020 - update to to list the number of networks bound to each template and only lists templates that have less than 90 networks bound
 # 20251028 - tighthen the template selection logic to more accurately return templates relevant to the current network/template
 # 20251028 - removed redundant and unsed functions
+# 20251117 - _port_dict_by_number immediately returns {} if ports isn’t a list (e.g., None), so no iteration over None.
+    # - compute_port_overrides normalizes None to [] and guards types before comparing.
+# 20251117 - adding checkpoints 
 
 import requests
 import logging
@@ -19,11 +22,12 @@ import os
 import time
 import signal
 import sys
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple, Set, Union, Callable, cast
 from openpyxl import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.utils import get_column_letter
-import unicodedata
+from dataclasses import dataclass, asdict
 from difflib import SequenceMatcher  # still used elsewhere for network matching if needed
 
 # =====================
@@ -121,6 +125,79 @@ def _get_org_networks_cached(org_id: str, ttl_seconds: int = 120) -> List[Dict[s
     _ORG_NETWORKS_CACHE[org_id] = {"expires": now + ttl_seconds, "networks": nets}
     return nets
 
+# ---------- Resume Checkpoint ----------
+CHECKPOINT_DIR = ".meraki_rebind_state"
+
+@dataclass
+class Checkpoint:
+    org_id: str
+    network_id: str
+    network_name: str = ""
+    step_status: Optional[Dict[str, Union[bool, str]]] = None
+    pre_change_template: Optional[str] = None
+    pre_change_devices: Optional[List[Dict[str, Any]]] = None
+    pre_change_vlans: Optional[List[Dict[str, Any]]] = None
+    claimed_serials: Optional[List[str]] = None
+    removed_serials: Optional[List[str]] = None
+    suggested_template_id: Optional[str] = None
+    bound_template_id: Optional[str] = None
+
+    # NEW: resume-safe fields
+    primary_mx_serial: Optional[str] = None
+    mr_order: Optional[List[str]] = None
+    ms_order: Optional[List[str]] = None
+    claimed_models: Optional[Dict[str, str]] = None
+
+    def path(self) -> str:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        fname = f"{self.org_id}_{self.network_id}.json"
+        return os.path.join(CHECKPOINT_DIR, fname)
+
+    def save(self) -> None:
+        payload = asdict(self)
+        with open(self.path(), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def load(org_id: str, network_id: str) -> Optional["Checkpoint"]:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        path = os.path.join(CHECKPOINT_DIR, f"{org_id}_{network_id}.json")
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return Checkpoint(
+            org_id=data["org_id"],
+            network_id=data["network_id"],
+            network_name=data.get("network_name", ""),
+            step_status=data.get("step_status") or {},
+            pre_change_template=data.get("pre_change_template"),
+            pre_change_devices=data.get("pre_change_devices") or [],
+            pre_change_vlans=data.get("pre_change_vlans") or [],
+            claimed_serials=data.get("claimed_serials") or [],
+            removed_serials=data.get("removed_serials") or [],
+            suggested_template_id=data.get("suggested_template_id"),
+            bound_template_id=data.get("bound_template_id"),
+            primary_mx_serial=data.get("primary_mx_serial"),
+            mr_order=data.get("mr_order") or [],
+            ms_order=data.get("ms_order") or [],
+            claimed_models=data.get("claimed_models") or {},
+        )
+
+    def mark(self, key: str, value: Union[bool, str]) -> None:
+        if self.step_status is None:
+            self.step_status = {}
+        self.step_status[key] = value
+        self.save()
+
+    def done(self, key: str) -> bool:
+        v = (self.step_status or {}).get(key)
+        return bool(v is True or (isinstance(v, str) and v.upper() == "NA"))
+
+
+_current_checkpoint: Optional[Checkpoint] = None
+
+
 def _template_counts_for_org(org_id: str) -> Dict[str, int]:
     """
     Compute counts for ALL templates by scanning org networks once.
@@ -139,6 +216,7 @@ def _template_counts_for_org(org_id: str) -> Dict[str, int]:
 
     _TEMPLATE_COUNT_CACHE[org_id] = counts
     return counts
+
 
 
 # =====================
@@ -195,10 +273,20 @@ HEADERS = {
 # Graceful abort
 _aborted = False
 def _handle_sigint(signum, frame):
-    global _aborted
+    global _aborted, _current_checkpoint
     _aborted = True
-    print("\nReceived Ctrl+C — attempting graceful shutdown...")
-    log_change('workflow_abort', 'User interrupted with SIGINT')
+    print("\nReceived Ctrl+C — attempting graceful checkpoint & shutdown...")
+    try:
+        log_change('workflow_abort', 'User interrupted with SIGINT')
+    finally:
+        if _current_checkpoint is not None:
+            try:
+                _current_checkpoint.save()
+                print(f"Saved progress to {_current_checkpoint.path()}")
+            except Exception:
+                logging.exception("Failed to save checkpoint on SIGINT")
+    raise SystemExit(1)
+
 signal.signal(signal.SIGINT, _handle_sigint)
 
 # =====================
@@ -486,22 +574,42 @@ def _normalize_tags(value):
         return sorted([t for t in value.split() if t])
     return []
 
-def _port_dict_by_number(ports: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _port_dict_by_number(ports: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build a dict keyed by port number/id. Tolerates None and non-dict entries.
+    """
     out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(ports, list):
+        return out
     for p in ports:
+        if not isinstance(p, dict):
+            continue
         pid = p.get("portId") or p.get("number") or p.get("name")
         if pid is None:
             continue
         out[str(pid)] = p
     return out
 
-def compute_port_overrides(live_ports: List[Dict[str, Any]], tmpl_ports: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+
+def compute_port_overrides(
+    live_ports: Optional[List[Dict[str, Any]]],
+    tmpl_ports: Optional[List[Dict[str, Any]]]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Compare live vs template ports and return the fields from live that differ.
+    Always returns a dict; tolerates None/invalid inputs.
+    """
     overrides: Dict[str, Dict[str, Any]] = {}
-    live = _port_dict_by_number(live_ports)
-    tmpl = _port_dict_by_number(tmpl_ports)
+
+    live_list = live_ports if isinstance(live_ports, list) else []
+    tmpl_list = tmpl_ports if isinstance(tmpl_ports, list) else []
+
+    live = _port_dict_by_number(live_list)
+    tmpl = _port_dict_by_number(tmpl_list)
+
     for pid, lp in live.items():
         tp = tmpl.get(pid)
-        if not tp:
+        if not isinstance(tp, dict):
             continue
         for fld in _PORT_FIELDS:
             lv = lp.get(fld)
@@ -511,7 +619,9 @@ def compute_port_overrides(live_ports: List[Dict[str, Any]], tmpl_ports: List[Di
                 tv = _normalize_tags(tv)
             if lv is not None and lv != tv:
                 overrides.setdefault(pid, {})[fld] = lv
+
     return overrides
+
 
 def apply_port_overrides(serial: str, overrides: Dict[str, Dict[str, Any]]) -> None:
     for pid, patch in overrides.items():
@@ -1289,7 +1399,8 @@ def safe_enable_wan2_on_claimed_mx(org_id: str, claimed: List[str]) -> None:
         logging.exception("Failed enabling WAN2 on claimed MX devices")
 
 def remove_recently_added_tag(network_id: str):
-    devs = meraki_get(f"/networks/{network_id}/devices")
+    devs_raw = meraki_get(f"/networks/{network_id}/devices")
+    devs: List[Dict[str, Any]] = devs_raw if isinstance(devs_raw, list) else []
     for d in devs:
         tags = d.get('tags', [])
         if not isinstance(tags, list):
@@ -1342,12 +1453,6 @@ def _pick_template_by_vlan_count(
             return t
     return None
 
-
-def _current_vlan_count(network_id: str) -> Optional[int]:
-    vlans = fetch_vlan_details(network_id)
-    return len(vlans) if isinstance(vlans, list) else None
-
-# ---------- Template rebind helpers (with rollback) ----------
 def list_and_rebind_template(
     org_id: str,
     network_id: str,
@@ -1367,6 +1472,8 @@ def list_and_rebind_template(
       - shows the number of networks bound to each template
       - only lists templates with < 90 networks bound
       - preserves existing VLAN-based suggestion behavior
+      - for 4 VLANs, excludes 'NO LEGACY ... MX' and '3 X DATA VLAN ... MX75' templates
+    Returns: (new_template_id, new_template_name, rollback_triggered)
     """
     skip_attempts = 0
 
@@ -1387,12 +1494,14 @@ def list_and_rebind_template(
 
         bound_count = all_counts.get(tid)
         if bound_count is None:
-            t2 = dict(t); t2["_boundCount"] = None
+            t2 = dict(t)
+            t2["_boundCount"] = None
             unknown.append(t2)
             continue
 
         if bound_count < 90:
-            t2 = dict(t); t2["_boundCount"] = bound_count
+            t2 = dict(t)
+            t2["_boundCount"] = bound_count
             eligible.append(t2)
 
     # If we have no eligible ones, fall back to unknown list (so the menu isn't empty)
@@ -1407,7 +1516,7 @@ def list_and_rebind_template(
         # Prefer eligible (<90), but also append unknown so you still have options
         filtered = eligible + unknown
 
-    # Optional model suffix filter (MX67/MX75) over the already filtered list
+    # Optional model suffix filter (MX67/MX75) over the current list
     if mx_model_filter in {'MX67', 'MX75'}:
         suffix = mx_model_filter.upper()
         subset = [t for t in filtered if (t.get('name') or '').strip().upper().endswith(suffix)]
@@ -1452,7 +1561,7 @@ def list_and_rebind_template(
     while True:
         print(f"\nCurrent network: {network_name} (ID: {network_id})")
         log_change('current_network_info', f"Current network: {network_name}",
-                org_id=org_id, network_id=network_id, network_name=network_name)
+                   org_id=org_id, network_id=network_id, network_name=network_name)
 
         # Show current bound template (if any)
         if current_id:
@@ -1461,13 +1570,13 @@ def list_and_rebind_template(
                 curr_name = curr.get('name', '<unknown>')
                 print(f"Bound template: {curr_name} (ID: {current_id})\n")
                 log_change('bound_template_info',
-                        f"Bound template {curr_name} ({current_id})",
-                        network_id=network_id, network_name=network_name)
+                           f"Bound template {curr_name} ({current_id})",
+                           network_id=network_id, network_name=network_name)
             except Exception:
                 print(f"Bound template ID: {current_id}\n")
                 log_change('bound_template_info',
-                        f"Bound template ID: {current_id}",
-                        network_id=network_id, network_name=network_name)
+                           f"Bound template ID: {current_id}",
+                           network_id=network_id, network_name=network_name)
         else:
             print("No template bound.\n")
 
@@ -1483,7 +1592,7 @@ def list_and_rebind_template(
         if suggested_tpl:
             print(f"\nSuggestion: Based on VLAN count ({vlan_count}), '{suggested_tpl.get('name')}' looks appropriate.")
             print("Press 'a' to auto-select the suggested template, or choose a number. "
-                "Press Enter / type 'skip'/'cancel' to cancel (twice cancels with rollback).")
+                  "Press Enter / type 'skip'/'cancel' to cancel (twice cancels with rollback).")
 
         sel = input("Select template # (or 'a' to accept suggestion): ").strip().lower()
 
@@ -1533,8 +1642,8 @@ def list_and_rebind_template(
             _TEMPLATE_COUNT_CACHE.pop(org_id, None)
 
             log_change('template_bind',
-                    f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
-                    device_name=network_name, network_id=network_id, network_name=network_name)
+                       f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
+                       device_name=network_name, network_id=network_id, network_name=network_name)
             print(f"✅ Bound to {chosen.get('name')}")
             return chosen['id'], chosen.get('name'), False
 
@@ -1584,6 +1693,12 @@ def list_and_rebind_template(
 
     # Safety net for type checkers; execution should never reach here.
     return current_id, None, False
+
+def _current_vlan_count(network_id: str) -> Optional[int]:
+    vlans = fetch_vlan_details(network_id)
+    return len(vlans) if isinstance(vlans, list) else None
+
+# ---------- Template rebind helpers (with rollback) ----------
 
 
 def bind_network_to_template(
@@ -2247,6 +2362,32 @@ if __name__ == '__main__':
 
     # -------- Select Network --------
     network_id, network_name = select_network_interactive(org_id)
+    
+    # ---- Resume checkpoint (create or load) ----
+    cp_existing = Checkpoint.load(org_id, network_id)
+    if cp_existing:
+        print(f"\n🟨 Found previous session for {network_name} ({network_id}).")
+        ans = input("Resume where you left off? (Y/n): ").strip().lower()
+        if ans in {"", "y", "yes"}:
+            _current_checkpoint = cp_existing
+            # Carry over previous step_status; we still recalc live state below
+            step_status.update(_current_checkpoint.step_status or {})
+        else:
+            _current_checkpoint = Checkpoint(
+                org_id=org_id, network_id=network_id, network_name=network_name,
+                step_status={}, pre_change_template=None,
+                pre_change_devices=[], pre_change_vlans=[],
+                claimed_serials=[], removed_serials=[]
+            )
+            _current_checkpoint.save()
+    else:
+        _current_checkpoint = Checkpoint(
+            org_id=org_id, network_id=network_id, network_name=network_name,
+            step_status={}, pre_change_template=None,
+            pre_change_devices=[], pre_change_vlans=[],
+            claimed_serials=[], removed_serials=[]
+        )
+        _current_checkpoint.save()
 
     net_info = meraki_get(f"/networks/{network_id}")
     old_template: Optional[str] = net_info.get('configTemplateId')
@@ -2257,6 +2398,12 @@ if __name__ == '__main__':
     pre_change_vlans = fetch_vlan_details(network_id)
     pre_change_template = old_template
     pre_change_serials: Set[str] = {d['serial'] for d in pre_change_devices}
+    
+    # Save PRE state into checkpoint
+    _current_checkpoint.pre_change_template = pre_change_template
+    _current_checkpoint.pre_change_devices = pre_change_devices
+    _current_checkpoint.pre_change_vlans = pre_change_vlans
+    _current_checkpoint.save()
 
     # For snapshot/xlsx mapping: template profileId -> name
     old_profileid_to_name: Dict[str, str] = {}
@@ -2288,9 +2435,13 @@ if __name__ == '__main__':
             print("No template bound.")
         print(f"Detected MX model(s): {', '.join(current_mx_models)}")
 
-        step_status['template_bound'] = "NA"
-        step_status['vlans_updated'] = "NA"
-        step_status['mx_removed'] = "NA"
+            # Initialize PATH A status fields only once (safe for resume)
+        if not _current_checkpoint.done('init_path_a_status'):
+            step_status.setdefault('template_bound', "NA")
+            step_status.setdefault('vlans_updated', "NA")
+            step_status.setdefault('mx_removed', "NA")
+            _current_checkpoint.mark('init_path_a_status', True)
+
 
         # Optional: VLAN-count based template suggestion in light flow
         try:
@@ -2349,8 +2500,15 @@ if __name__ == '__main__':
         safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
             org_id, network_id, prevalidated_serials  # allow wireless
         )
-        claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
-        step_status['devices_claimed'] = bool(claimed)
+        if not _current_checkpoint.done('devices_claimed'):
+            claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
+            step_status['devices_claimed'] = bool(claimed)
+            _current_checkpoint.claimed_serials = claimed or _current_checkpoint.claimed_serials or []
+            _current_checkpoint.mark('devices_claimed', step_status['devices_claimed'])
+        else:
+            print("⏭️  Skipping device claim (already completed).")
+            claimed = _current_checkpoint.claimed_serials or []
+
 
         # Enable WAN2
         safe_enable_wan2_on_claimed_mx(org_id, claimed)
@@ -2422,6 +2580,11 @@ if __name__ == '__main__':
         post_change_serials = {d['serial'] for d in post_change_devices}
         claimed_serials_rb = list(post_change_serials - pre_change_serials)
         removed_serials_rb = list(pre_change_serials - post_change_serials)
+        _current_checkpoint.claimed_serials = claimed_serials_rb
+        _current_checkpoint.removed_serials = removed_serials_rb
+        _current_checkpoint.save()
+
+        
         # --- Build POST state & export one combined workbook (PATH A) ---
         final_tpl_id = meraki_get(f"/networks/{network_id}").get('configTemplateId')
         final_mx, final_ms, final_mr = fetch_devices(org_id, network_id, template_id=final_tpl_id)
@@ -2456,6 +2619,13 @@ if __name__ == '__main__':
             ms, network_name,
             claimed_serials=claimed_serials_rb, removed_serials=removed_serials_rb
         )
+        try:
+            if _current_checkpoint:
+                os.remove(_current_checkpoint.path())
+                print("🧹 Cleared resume checkpoint.")
+        except Exception:
+            pass
+
         raise SystemExit(0)
 
     # ------------------------------------------------------------------
@@ -2468,54 +2638,67 @@ if __name__ == '__main__':
         sw['serial']: (sw.get('port_overrides') or {}) for sw in prebind_ms_devices
     }
 
-    # Choose & (re)bind template (with rollback on failure)
-    try:
-        new_template, _, rolled_back = list_and_rebind_template(
-            org_id=org_id,
-            network_id=network_id,
-            current_id=old_template,
-            network_name=network_name,
-            pre_change_devices=pre_change_devices,
-            pre_change_vlans=pre_change_vlans,
-            pre_change_template=pre_change_template,
-            claimed_serials=[],
-            removed_serials=[],
-            ms_list=ms,
-            mx_model_filter=mx_model_filter,
-        )
-        if rolled_back:
-            log_change('workflow_end', 'Exited after rollback during template stage')
-            print("Rollback complete. Exiting.")
-            raise SystemExit(1)
-        step_status['template_bound'] = (new_template is not None) and (new_template != old_template)
-    except SystemExit:
-        raise
-    except Exception:
-        logging.exception("Template bind failed")
-        new_template = old_template
-        step_status['template_bound'] = False
+       # Choose & (re)bind template (with rollback on failure)
+    # --- Template selection / rebind (checkpointed & idempotent) ---
+    if not _current_checkpoint.done('template_bound'):
+        try:
+            new_template, new_tpl_name, rollback_needed = list_and_rebind_template(
+                org_id=org_id,
+                network_id=network_id,
+                current_id=old_template,
+                network_name=network_name,
+                pre_change_devices=pre_change_devices,
+                pre_change_vlans=pre_change_vlans,
+                pre_change_template=pre_change_template,
+                claimed_serials=_current_checkpoint.claimed_serials or [],
+                removed_serials=_current_checkpoint.removed_serials or [],
+                ms_list=prebind_ms_devices,
+                mx_model_filter=mx_model_filter,
+            )
 
-    # Validate VLANs after bind + update VLANs
-    try:
-        bind_network_to_template(
-            org_id=org_id,
-            network_id=network_id,
-            tpl_id=new_template,
-            vlan_list=vlan_list,
-            network_name=network_name,
-            pre_change_devices=pre_change_devices,
-            pre_change_vlans=pre_change_vlans,
-            pre_change_template=pre_change_template,
-            claimed_serials=[],
-            removed_serials=[],
-            ms_list=ms
-        )
-        step_status['vlans_updated'] = True
-    except SystemExit:
-        raise
-    except Exception:
-        logging.exception("VLAN update failed")
-        step_status['vlans_updated'] = False
+            step_status['template_bound'] = bool(new_template and new_template != old_template)
+            _current_checkpoint.bound_template_id = new_template or old_template
+            _current_checkpoint.mark('template_bound', step_status['template_bound'])
+
+            # Stop here if rollback triggered (list_and_rebind_template already did the rollback)
+            if rollback_needed:
+                raise SystemExit(0)
+
+        except Exception:
+            logging.exception("Template bind step failed")
+            step_status['template_bound'] = False
+            _current_checkpoint.mark('template_bound', step_status['template_bound'])
+            new_template = _current_checkpoint.bound_template_id or old_template
+    else:
+        print("⏭️  Skipping template selection/bind (already completed).")
+        new_template = _current_checkpoint.bound_template_id or old_template
+
+        # VLAN update after rebind
+    if not _current_checkpoint.done('vlans_updated'):
+        try:
+            bind_network_to_template(
+                org_id=org_id,
+                network_id=network_id,
+                tpl_id=new_template,
+                vlan_list=pre_change_vlans,
+                network_name=network_name,
+                pre_change_devices=pre_change_devices,
+                pre_change_vlans=pre_change_vlans,
+                pre_change_template=pre_change_template,
+                claimed_serials=_current_checkpoint.claimed_serials or [],
+                removed_serials=_current_checkpoint.removed_serials or [],
+                ms_list=prebind_ms_devices,
+            )
+            step_status['vlans_updated'] = True
+            _current_checkpoint.mark('vlans_updated', True)
+        except Exception:
+            logging.exception("VLAN update step failed after template bind")
+            step_status['vlans_updated'] = False
+            _current_checkpoint.mark('vlans_updated', False)
+    else:
+        print("⏭️  Skipping VLAN update (already completed).")
+
+
 
     # Fetch new template profiles for post-bind MS mapping
     try:
@@ -2564,61 +2747,137 @@ if __name__ == '__main__':
     safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
         org_id, network_id, prevalidated_serials
     )
-    claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
-    step_status['devices_claimed'] = bool(claimed)
+    if not _current_checkpoint.done('devices_claimed'):
+        claimed = claim_devices(org_id, network_id, prevalidated_serials=safe_to_claim)
+        step_status['devices_claimed'] = bool(claimed)
+        _current_checkpoint.claimed_serials = claimed or _current_checkpoint.claimed_serials or []
+        _current_checkpoint.mark('devices_claimed', step_status['devices_claimed'])
+    else:
+        print("⏭️  Skipping device claim (already completed).")
+        claimed = _current_checkpoint.claimed_serials or []
 
     # Enable WAN2
-    safe_enable_wan2_on_claimed_mx(org_id, claimed)
+    if claimed and not _current_checkpoint.done('wan2_enabled'):
+        safe_enable_wan2_on_claimed_mx(org_id, claimed)
+        _current_checkpoint.mark('wan2_enabled', True)
 
-    # Primary / order
-    primary_mx_serial = select_primary_mx(org_id, claimed)
-    ensure_primary_mx(network_id, primary_mx_serial)
-    mr_order = select_device_order(org_id, claimed, 'MR')
-    ms_order = select_device_order(org_id, claimed, 'MS')
+
+    # # Primary / order
+    # primary_mx_serial = select_primary_mx(org_id, claimed)
+    # ensure_primary_mx(network_id, primary_mx_serial)
+    # mr_order = select_device_order(org_id, claimed, 'MR')
+    # ms_order = select_device_order(org_id, claimed, 'MS')
+    
+    # --- 6D) Primary / order (idempotent with checkpoint) ---
+
+    # Primary selection + swap
+    if not _current_checkpoint.done('primary_selected'):
+        primary_mx_serial = select_primary_mx(org_id, claimed)
+        ensure_primary_mx(network_id, primary_mx_serial)
+        _current_checkpoint.primary_mx_serial = primary_mx_serial or _current_checkpoint.primary_mx_serial
+        _current_checkpoint.mark('primary_selected', True)
+    else:
+        print("⏭️  Skipping primary MX selection (already completed).")
+        primary_mx_serial = _current_checkpoint.primary_mx_serial
+
+    # MR ordering
+    if not _current_checkpoint.done('mr_order'):
+        mr_order = select_device_order(org_id, claimed, 'MR')
+        _current_checkpoint.mr_order = mr_order or _current_checkpoint.mr_order or []
+        _current_checkpoint.mark('mr_order', True)
+    else:
+        print("⏭️  Skipping MR order (already completed).")
+        mr_order = _current_checkpoint.mr_order or []
+
+    # MS ordering
+    if not _current_checkpoint.done('ms_order'):
+        ms_order = select_device_order(org_id, claimed, 'MS')
+        _current_checkpoint.ms_order = ms_order or _current_checkpoint.ms_order or []
+        _current_checkpoint.mark('ms_order', True)
+    else:
+        print("⏭️  Skipping MS order (already completed).")
+        ms_order = _current_checkpoint.ms_order or []
+
 
     # Compute deltas for rollback (after all device changes)
-    post_change_devices = meraki_get(f"/networks/{network_id}/devices")
-    post_change_serials = {d['serial'] for d in post_change_devices}
-    claimed_serials = list(post_change_serials - pre_change_serials)
-    removed_serials = list(pre_change_serials - post_change_serials)
+    post_change_devices_raw = meraki_get(f"/networks/{network_id}/devices")
+    post_change_devices = post_change_devices_raw if isinstance(post_change_devices_raw, list) else []
+    post_change_serials = {d.get('serial') for d in post_change_devices if d.get('serial')}
+    claimed_serials_rb = list(post_change_serials - pre_change_serials)
+    removed_serials_rb = list(pre_change_serials - post_change_serials)
+    _current_checkpoint.claimed_serials = claimed_serials_rb
+    _current_checkpoint.removed_serials = removed_serials_rb
+    _current_checkpoint.save()
+
+
 
     if claimed:
         new_mx, ms_list, mr_list = fetch_devices(org_id, network_id)
         step_status['old_mx'] = bool([d['serial'] for d in old_mx])
         step_status['old_mr33'] = bool([d['serial'] for d in old_mr if d['model'] == 'MR33'])
 
-        # Remove MX64 if newer MX was claimed
-        try:
-            mx_models = []
-            for s in claimed:
-                try:
-                    inv = get_inventory_device(org_id, s)
-                    mx_models.append(inv.get('model', '') or '')
-                except Exception:
-                    pass
-            if any(m.startswith('MX67') or m.startswith('MX75') for m in mx_models):
-                remove_existing_mx64_devices(org_id, network_id)
-                log_change('mx_removed', "Removed old MX64 after new MX claim", misc=f"claimed_serials={claimed}")
-            step_status['mx_removed'] = True
-        except Exception:
-            logging.exception("MX64 removal stage failed")
-            step_status['mx_removed'] = False
+    # Legacy removals (checkpointed & idempotent) ---
 
-        # Remove legacy MR33 only if new wireless was claimed
-        try:
-            inv_models_claimed = _get_inventory_models_for_serials(org_id, claimed)
-            claimed_has_wireless = any(_is_wireless_model(m) for m in inv_models_claimed.values())
-            if claimed_has_wireless:
-                mr33_ok = remove_existing_mr33_devices(org_id, network_id)
-                step_status['mr33_removed'] = mr33_ok
-                if mr33_ok:
-                    log_change('mr33_removed', "Removed old MR33 after new AP claim", misc=f"claimed_serials={claimed}")
-            else:
-                step_status['mr33_removed'] = "NA"
-        except Exception:
-            logging.exception("MR33 removal stage failed")
-            step_status['mr33_removed'] = False
+        # Cache claimed models once for both MX64/MR33 decisions
+        if _current_checkpoint.claimed_models is None:
+            try:
+                _current_checkpoint.claimed_models = _get_inventory_models_for_serials(org_id, claimed)
+            except Exception:
+                logging.exception("Failed to read claimed models for legacy removal checks")
+                _current_checkpoint.claimed_models = {}
 
+        # Always coerce to a dict for type safety
+        claimed_models: Dict[str, str] = _current_checkpoint.claimed_models or {}
+
+        # MX64 removal (only if a newer MX was actually claimed)
+        if not _current_checkpoint.done('mx64_removed'):
+            try:
+                newer_claimed = any(
+                    (m or "").startswith(("MX67", "MX75"))
+                    for m in claimed_models.values()
+                )
+                if newer_claimed:
+                    ok = remove_existing_mx64_devices(org_id, network_id)
+                    step_status['mx_removed'] = ok
+                    if ok:
+                        log_change(
+                            'mx_removed',
+                            "Removed old MX64 after new MX claim",
+                            misc=f"claimed_serials={claimed}"
+                        )
+                else:
+                    step_status['mx_removed'] = "NA"
+                _current_checkpoint.mark('mx64_removed', True)
+            except Exception:
+                logging.exception("MX64 removal stage failed")
+                step_status['mx_removed'] = False
+        else:
+            print("⏭️  Skipping MX64 removal (already completed).")
+
+        # MR33 removal (only if any wireless device was claimed this run)
+        if not _current_checkpoint.done('mr33_removed'):
+            try:
+                claimed_has_wireless = any(
+                    _is_wireless_model(m) for m in claimed_models.values()
+                )
+                if claimed_has_wireless:
+                    ok = remove_existing_mr33_devices(org_id, network_id)
+                    step_status['mr33_removed'] = ok
+                    if ok:
+                        log_change(
+                            'mr33_removed',
+                            "Removed old MR33 after new AP claim",
+                            misc=f"claimed_serials={claimed}"
+                        )
+                else:
+                    step_status['mr33_removed'] = "NA"
+                _current_checkpoint.mark('mr33_removed', True)
+            except Exception:
+                logging.exception("MR33 removal stage failed")
+                step_status['mr33_removed'] = False
+        else:
+            print("⏭️  Skipping MR33 removal (already completed).")
+   
         # Naming & configuration for claimed devices
         try:
             name_and_configure_claimed_devices(
@@ -2660,28 +2919,31 @@ if __name__ == '__main__':
         except Exception:
             logging.exception("Failed fetching final template switch profiles")
 
-    export_combined_snapshot_xlsx(
-        org_id=org_id, network_id=network_id, network_name=network_name,
-        pre_template_id=pre_change_template,
-        pre_vlan_list=pre_change_vlans,
-        pre_mx_list=mx,
-        pre_ms_list=ms,
-        pre_mr_list=mr,
-        pre_profileid_to_name=old_profileid_to_name,
-        post_template_id=final_tpl_id,
-        post_vlan_list=final_vlans,
-        post_mx_list=final_mx,
-        post_ms_list=final_ms,
-        post_mr_list=final_mr,
-        post_profileid_to_name=profileid_to_name_post,
-        outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_combined_{timestamp}.xlsx",
-    )
-
+    if not _current_checkpoint.done('snapshot_exported'):    
+        export_combined_snapshot_xlsx(
+            org_id=org_id, network_id=network_id, network_name=network_name,
+            pre_template_id=pre_change_template,
+            pre_vlan_list=pre_change_vlans,
+            pre_mx_list=mx,
+            pre_ms_list=ms,
+            pre_mr_list=mr,
+            pre_profileid_to_name=old_profileid_to_name,
+            post_template_id=final_tpl_id,
+            post_vlan_list=final_vlans,
+            post_mx_list=final_mx,
+            post_ms_list=final_ms,
+            post_mr_list=final_mr,
+            post_profileid_to_name=profileid_to_name_post,
+            outfile=f"{_slug_filename(_network_tag_from_name(network_name))}_combined_{timestamp}.xlsx",
+        )
+        _current_checkpoint.mark('snapshot_exported', True)
+    else:
+        print("⏭️  Skipping snapshot export (already completed).")
 
     # -------- Enhanced rollback prompt (extracted) --------
     maybe_prompt_and_rollback(
         org_id, network_id,
         pre_change_devices, pre_change_vlans, pre_change_template,
         ms, network_name,
-        claimed_serials=claimed_serials, removed_serials=removed_serials
+        claimed_serials=claimed_serials_rb, removed_serials=removed_serials_rb
     )
