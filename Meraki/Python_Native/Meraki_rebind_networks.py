@@ -1,4 +1,5 @@
 # Created by JS 
+# version 20251121
 # uses the native python library to rebind a meraki network to a new template 
     # allows the claiming and addining of new devices to the network replacing old devices / models
 # 20250905 - updated to enable WAN2 on the new MX's
@@ -10,6 +11,8 @@
 # 20251117 - _port_dict_by_number immediately returns {} if ports isn’t a list (e.g., None), so no iteration over None.
     # - compute_port_overrides normalizes None to [] and guards types before comparing.
 # 20251117 - adding checkpoints 
+# 20251120 - update the template selection logic
+# 20251121 - update to remove session state at end of rollback
 
 import requests
 import logging
@@ -1423,35 +1426,83 @@ def remove_recently_added_tag(network_id: str):
 def _pick_template_by_vlan_count(
     templates: List[Dict[str, Any]],
     vlan_count: Optional[int],
+    current_template_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Suggest a template based on VLAN count:
       - 3 VLANs  -> match name like 'NO LEGACY ... MX' or '... MX67/MX75'
       - 5 VLANs  -> match name like '3 X DATA VLAN ... MX75'
-      - 4 VLANs  -> NO SUGGESTION (returns None)
+      - 4 VLANs  -> if current_template_name looks like a CloudStore variant,
+                    try to find a corresponding ...-MX67 / ...-MX75 template
       - other    -> raise ValueError so the caller can warn the user
     """
     if vlan_count is None:
         return None
 
+    # ---------- 3 VLANs ----------
     if vlan_count == 3:
         patterns = [r'NO\s*LEGACY.*MX(?:\d{2})?\b']
+
+    # ---------- 5 VLANs ----------
     elif vlan_count == 5:
         patterns = [r'3\s*X\s*DATA[_\s-]*VLAN.*MX75\b']
+
+    # ---------- 4 VLANs: CloudStore name-based selection ----------
     elif vlan_count == 4:
-        # Explicitly do NOT suggest any template for 4 VLANs
+        if not current_template_name:
+            return None
+
+        name = current_template_name.strip()
+
+        # Match either:
+        #   GBR-CT-CloudStore-001
+        #   GBR-CT-CloudStore-PreSCE-001
+        m = re.match(r'^(GBR-CT-CloudStore(?:-PreSCE)?-\d{3})$', name, re.IGNORECASE)
+        if not m:
+            # Name doesn't match the CloudStore pattern → no suggestion
+            return None
+
+        base = m.group(1)  # e.g. GBR-CT-CloudStore-001 or GBR-CT-CloudStore-PreSCE-001
+        wanted_prefixes = [
+            f"{base}-MX67",
+            f"{base}-MX75",
+        ]
+
+        for t in templates:
+            tname = (t.get("name") or "").strip()
+            upper_name = tname.upper()
+            if any(upper_name.startswith(p.upper()) for p in wanted_prefixes):
+                return t
+
+        # No match found → no suggestion
         return None
+
     else:
         raise ValueError(
             "Incorrect number of VLANs detected in the current network. "
             "Please double check the selected network."
         )
 
+    # ---------- Default regex-based matching for 3 / 5 VLANs ----------
     for t in templates:
         name = (t.get('name') or '')
         if any(re.search(pat, name, re.IGNORECASE) for pat in patterns):
             return t
     return None
+
+def _get_template_name(org_id: str, template_id: Optional[str]) -> Optional[str]:
+    """
+    Safely resolve a config template ID to its name.
+    Returns None if template_id is empty or lookup fails.
+    """
+    if not template_id:
+        return None
+    try:
+        tpl = meraki_get(f"/organizations/{org_id}/configTemplates/{template_id}") or {}
+        return str(tpl.get("name") or "")
+    except Exception:
+        logging.exception("Could not fetch template name for %s", template_id)
+        return None
 
 def list_and_rebind_template(
     org_id: str,
@@ -1510,7 +1561,8 @@ def list_and_rebind_template(
         return current_id, None, False
 
     if not eligible and unknown:
-        print("⚠️ Could not compute bound counts (or none are under 90). Showing templates with unknown counts; they may exceed the 90 limit.")
+        print("⚠️ Could not compute bound counts (or none are under 90). "
+              "Showing templates with unknown counts; they may exceed the 90 limit.")
         filtered: List[Dict[str, Any]] = unknown[:]
     else:
         # Prefer eligible (<90), but also append unknown so you still have options
@@ -1523,10 +1575,14 @@ def list_and_rebind_template(
         if subset:
             filtered = subset
         else:
-            print(f"(No templates ending with {suffix} in the current list; showing all eligible/unknown templates instead.)")
+            print(f"(No templates ending with {suffix} in the current list; "
+                  f"showing all eligible/unknown templates instead.)")
 
     # VLAN-based filtering/suggestion
     vlan_count: Optional[int] = _current_vlan_count(network_id)
+
+    # Resolve current template name once (may be None)
+    current_tpl_name: Optional[str] = _get_template_name(org_id, current_id) if current_id else None
 
     # If VLAN count is exactly 4, exclude names matching the 3/5-VLAN patterns
     if vlan_count == 4:
@@ -1542,9 +1598,38 @@ def list_and_rebind_template(
             # Nothing to pick from; bail out without changing template.
             return current_id, None, False
 
+    # For 3- or 5-VLAN networks, only show templates in the same "family"
+    # as the currently bound template:
+    #   - If bound template name contains 'PreSCE' -> only show PreSCE templates
+    #   - Otherwise -> exclude any templates that contain 'PreSCE'
+    if vlan_count in (3, 5) and current_tpl_name:
+        up_curr = current_tpl_name.upper()
+
+        if "PRESCE" in up_curr:
+            # PreSCE family: require PRESCE in template name
+            narrowed = [
+                t for t in filtered
+                if "PRESCE" in (t.get('name') or "").upper()
+            ]
+        else:
+            # Plain CloudStore family: require CLOUDSTORE but exclude PRESCE
+            narrowed = [
+                t for t in filtered
+                if "CLOUDSTORE" in (t.get('name') or "").upper()
+                and "PRESCE" not in (t.get('name') or "").upper()
+            ]
+
+        # Only apply narrowing if it actually leaves us something
+        if narrowed:
+            filtered = narrowed
+
     # Now compute the suggestion against the final filtered list
     try:
-        suggested_tpl: Optional[Dict[str, Any]] = _pick_template_by_vlan_count(filtered, vlan_count)
+        suggested_tpl: Optional[Dict[str, Any]] = _pick_template_by_vlan_count(
+            filtered,
+            vlan_count,
+            current_template_name=current_tpl_name,
+        )
     except ValueError as e:
         print(f"❌ {e}")
         suggested_tpl = None
@@ -1560,23 +1645,24 @@ def list_and_rebind_template(
     # --- Selection loop ---
     while True:
         print(f"\nCurrent network: {network_name} (ID: {network_id})")
-        log_change('current_network_info', f"Current network: {network_name}",
-                   org_id=org_id, network_id=network_id, network_name=network_name)
+        log_change(
+            'current_network_info',
+            f"Current network: {network_name}",
+            org_id=org_id,
+            network_id=network_id,
+            network_name=network_name,
+        )
 
         # Show current bound template (if any)
         if current_id:
-            try:
-                curr = meraki_get(f"/organizations/{org_id}/configTemplates/{current_id}")
-                curr_name = curr.get('name', '<unknown>')
-                print(f"Bound template: {curr_name} (ID: {current_id})\n")
-                log_change('bound_template_info',
-                           f"Bound template {curr_name} ({current_id})",
-                           network_id=network_id, network_name=network_name)
-            except Exception:
-                print(f"Bound template ID: {current_id}\n")
-                log_change('bound_template_info',
-                           f"Bound template ID: {current_id}",
-                           network_id=network_id, network_name=network_name)
+            curr_name = _get_template_name(org_id, current_id) or "<unknown>"
+            print(f"Bound template: {curr_name} (ID: {current_id})\n")
+            log_change(
+                'bound_template_info',
+                f"Bound template {curr_name} ({current_id})",
+                network_id=network_id,
+                network_name=network_name,
+            )
         else:
             print("No template bound.\n")
 
@@ -1590,7 +1676,8 @@ def list_and_rebind_template(
             print(f"{i}. {name}{auto_mark} (ID: {tid}) — {cnt_str} bound")
 
         if suggested_tpl:
-            print(f"\nSuggestion: Based on VLAN count ({vlan_count}), '{suggested_tpl.get('name')}' looks appropriate.")
+            print(f"\nSuggestion: Based on VLAN count ({vlan_count}), "
+                  f"'{suggested_tpl.get('name')}' looks appropriate.")
             print("Press 'a' to auto-select the suggested template, or choose a number. "
                   "Press Enter / type 'skip'/'cancel' to cancel (twice cancels with rollback).")
 
@@ -1636,14 +1723,22 @@ def list_and_rebind_template(
         try:
             if current_id:
                 do_action(meraki_post, f"/networks/{network_id}/unbind")
-            do_action(meraki_post, f"/networks/{network_id}/bind", data={"configTemplateId": chosen['id']})
+            do_action(
+                meraki_post,
+                f"/networks/{network_id}/bind",
+                data={"configTemplateId": chosen['id']},
+            )
             # Invalidate org-level caches after a (re)bind, so later views are fresh
             _ORG_NETWORKS_CACHE.pop(org_id, None)
             _TEMPLATE_COUNT_CACHE.pop(org_id, None)
 
-            log_change('template_bind',
-                       f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
-                       device_name=network_name, network_id=network_id, network_name=network_name)
+            log_change(
+                'template_bind',
+                f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
+                device_name=network_name,
+                network_id=network_id,
+                network_name=network_name,
+            )
             print(f"✅ Bound to {chosen.get('name')}")
             return chosen['id'], chosen.get('name'), False
 
@@ -1962,6 +2057,17 @@ def rollback_all_changes(
     log_change('rollback_vlans', "Restored VLANs and DHCP assignments", device_name=f"Network: {network_id}")
 
     print("=== Rollback complete ===")
+    global _current_checkpoint
+    try:
+        cp = _current_checkpoint
+        if cp and cp.org_id == org_id and cp.network_id == network_id:
+            cp_path = cp.path()
+            if os.path.isfile(cp_path):
+                os.remove(cp_path)
+                print("🧹 Cleared resume checkpoint after rollback.")
+            _current_checkpoint = None
+    except Exception:
+        logging.exception("Failed to clear checkpoint after rollback")
 
 # =====================
 # Step Summary helpers (✅ / ❌ and skip N/A)
@@ -2050,10 +2156,10 @@ def _write_snapshot_sheet(
             if tpl_name_lookup:
                 tpl_name = tpl_name_lookup(template_id) or ""
             else:
-                tpl = meraki_get(f"/organizations/{org_id}/configTemplates/{template_id}")
-                tpl_name = str(tpl.get("name", "") or "")
+                tpl_name = _get_template_name(org_id, template_id) or ""
         except Exception:
             logging.exception("Could not fetch template name for snapshot")
+
 
     ws.append([
         "template", network_id, network_name, "template",
@@ -2425,15 +2531,22 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     if current_mx_models and not is_mx64_present:
         print(f"\nCurrent network: {network_name} (ID: {network_id})")
+        # if old_template:
+        #     try:
+        #         curr_tpl = meraki_get(f"/organizations/{org_id}/configTemplates/{old_template}")
+        #         print(f"Bound template: {curr_tpl.get('name','<unknown>')} (ID: {old_template})")
+        #     except Exception:
+        #         print(f"Bound template ID: {old_template}")
+        # else:
+        #     print("No template bound.")
+        # print(f"Detected MX model(s): {', '.join(current_mx_models)}")
         if old_template:
-            try:
-                curr_tpl = meraki_get(f"/organizations/{org_id}/configTemplates/{old_template}")
-                print(f"Bound template: {curr_tpl.get('name','<unknown>')} (ID: {old_template})")
-            except Exception:
-                print(f"Bound template ID: {old_template}")
+            curr_name = _get_template_name(org_id, old_template) or "<unknown>"
+            print(f"Bound template: {curr_name} (ID: {old_template})")
         else:
             print("No template bound.")
         print(f"Detected MX model(s): {', '.join(current_mx_models)}")
+
 
             # Initialize PATH A status fields only once (safe for resume)
         if not _current_checkpoint.done('init_path_a_status'):
@@ -2444,27 +2557,46 @@ if __name__ == '__main__':
 
 
         # Optional: VLAN-count based template suggestion in light flow
+        # Optional: VLAN-count based template suggestion in light flow
         try:
             all_templates_raw: Any = meraki_get(f"/organizations/{org_id}/configTemplates")
-            all_templates: List[Dict[str, Any]] = all_templates_raw if isinstance(all_templates_raw, list) else []
+            all_templates: List[Dict[str, Any]] = (
+                all_templates_raw if isinstance(all_templates_raw, list) else []
+            )
 
             vlan_count = _current_vlan_count(network_id)
-            suggested_tpl = _pick_template_by_vlan_count(all_templates, vlan_count)
+            # Current bound template name (may be None/empty)
+            current_tpl_name = _get_template_name(org_id, old_template) if old_template else None
+
+            suggested_tpl = _pick_template_by_vlan_count(
+                all_templates,
+                vlan_count,
+                current_template_name=current_tpl_name,
+            )
 
             if suggested_tpl and (not old_template or suggested_tpl.get('id') != old_template):
                 print(
                     f"\nSuggestion: Based on VLAN count ({vlan_count}), "
-                    f"'{suggested_tpl.get('name','')}' looks appropriate (ID: {suggested_tpl.get('id','')})."
+                    f"'{suggested_tpl.get('name','')}' looks appropriate "
+                    f"(ID: {suggested_tpl.get('id','')})."
                 )
-                ans = input("Press 'a' to bind to the suggested template, or Enter to keep current template: ").strip().lower()
+                ans = input(
+                    "Press 'a' to bind to the suggested template, or Enter to keep current template: "
+                ).strip().lower()
+
                 if ans == 'a':
                     try:
                         new_template = suggested_tpl.get('id')
                         if old_template:
                             do_action(meraki_post, f"/networks/{network_id}/unbind")
-                        do_action(meraki_post, f"/networks/{network_id}/bind", data={"configTemplateId": new_template})
+                        do_action(
+                            meraki_post,
+                            f"/networks/{network_id}/bind",
+                            data={"configTemplateId": new_template},
+                        )
                         print(f"✅ Bound to {suggested_tpl.get('name','')}")
 
+                        # Re-apply VLANs after (re)bind
                         bind_network_to_template(
                             org_id=org_id,
                             network_id=network_id,
@@ -2476,25 +2608,34 @@ if __name__ == '__main__':
                             pre_change_template=pre_change_template,
                             claimed_serials=[],
                             removed_serials=[],
-                            ms_list=ms
+                            ms_list=ms,
                         )
                         step_status['template_bound'] = True
                         step_status['vlans_updated'] = True
                         old_template = new_template
 
                     except MerakiAPIError as e:
-                        logging.exception("Light-flow suggested bind failed: %s %s", e.status_code, e.text)
+                        logging.exception(
+                            "Light-flow suggested bind failed: %s %s", e.status_code, e.text
+                        )
                         print("❌ Failed to bind suggested template in light flow.")
                         step_status['template_bound'] = False
                     except Exception:
                         logging.exception("Light-flow suggested bind failed (unexpected)")
-                        print("❌ Failed to bind suggested template in light flow (unexpected error).")
+                        print(
+                            "❌ Failed to bind suggested template in light flow "
+                            "(unexpected error)."
+                        )
                         step_status['template_bound'] = False
             else:
-                logging.debug("No VLAN-based suggestion available in light flow (vlan_count=%s).", vlan_count)
+                logging.debug(
+                    "No VLAN-based suggestion available in light flow (vlan_count=%s).",
+                    vlan_count,
+                )
 
         except Exception:
             logging.exception("Suggestion stage in light flow failed")
+
 
         # Wireless pre-check + claim
         safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
@@ -2761,14 +2902,8 @@ if __name__ == '__main__':
         safe_enable_wan2_on_claimed_mx(org_id, claimed)
         _current_checkpoint.mark('wan2_enabled', True)
 
-
-    # # Primary / order
-    # primary_mx_serial = select_primary_mx(org_id, claimed)
-    # ensure_primary_mx(network_id, primary_mx_serial)
-    # mr_order = select_device_order(org_id, claimed, 'MR')
-    # ms_order = select_device_order(org_id, claimed, 'MS')
     
-    # --- 6D) Primary / order (idempotent with checkpoint) ---
+    #  Primary / order (idempotent with checkpoint) ---
 
     # Primary selection + swap
     if not _current_checkpoint.done('primary_selected'):
