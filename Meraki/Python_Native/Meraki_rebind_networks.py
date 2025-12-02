@@ -1,5 +1,4 @@
 # Created by JS 
-# version 20251201
 # uses the native python library to rebind a meraki network to a new template 
     # allows the claiming and addining of new devices to the network replacing old devices / models
 # 20250905 - updated to enable WAN2 on the new MX's
@@ -14,6 +13,13 @@
 # 20251120 - update the template selection logic
 # 20251121 - update to remove session state at end of rollback
 # 20251201 - using Python's built-in exceptions instead of relying on 'try/except' blocks for error handling
+
+"""
+Meraki Rebind Networks Utility
+Version: 2025.12.01_01
+"""
+
+SCRIPT_VERSION = "2025.12.01_01"
 
 import requests
 import logging
@@ -2484,7 +2490,9 @@ def prompt_rollback_basic() -> str:
 # Main
 # =====================
 if __name__ == '__main__':
+    print(f"\n🔧 Meraki Rebind Tool — Version {SCRIPT_VERSION}\n")
     log_change('workflow_start', 'Script started')
+    logging.info(f"Starting Meraki Rebind Tool (version {SCRIPT_VERSION})")
 
     step_status: Dict[str, StatusVal] = {}
 
