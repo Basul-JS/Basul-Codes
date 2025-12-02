@@ -1,5 +1,5 @@
 # Created by JS 
-# version 20251121
+# version 20251201
 # uses the native python library to rebind a meraki network to a new template 
     # allows the claiming and addining of new devices to the network replacing old devices / models
 # 20250905 - updated to enable WAN2 on the new MX's
@@ -13,6 +13,7 @@
 # 20251117 - adding checkpoints 
 # 20251120 - update the template selection logic
 # 20251121 - update to remove session state at end of rollback
+# 20251201 - using Python's built-in exceptions instead of relying on 'try/except' blocks for error handling
 
 import requests
 import logging
@@ -89,7 +90,7 @@ def log_change(
             network_id or '',
             network_name or ''
         ])
-        
+
 # ---- Caches to avoid repeated org-wide scans (reduces 429s) ----
 _ORG_NETWORKS_CACHE: Dict[str, Dict[str, Any]] = {}
 # shape: { org_id: {"expires": float_epoch, "networks": List[Dict[str, Any]]} }
@@ -295,16 +296,17 @@ signal.signal(signal.SIGINT, _handle_sigint)
 # =====================
 # HTTP layer
 # =====================
-class MerakiAPIError(Exception):
-    def __init__(self, status_code: int, text: str, json_body: Optional[Any], url: str):
-        super().__init__(f"Meraki API error: {status_code} {text}")
-        self.status_code = status_code
-        self.text = text
-        self.json_body = json_body
-        self.url = url
 
 def _request(method: str, path: str, *, params=None, json_data=None) -> Any:
+    """
+    Low-level HTTP wrapper.
+
+    * Uses requests' built-in HTTPError (via raise_for_status)
+    * Retries on generic RequestException and 429 responses
+    * Returns parsed JSON when possible, else raw text / None
+    """
     url = f"{BASE_URL}{path}"
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if method == 'GET':
@@ -316,8 +318,9 @@ def _request(method: str, path: str, *, params=None, json_data=None) -> Any:
             elif method == 'DELETE':
                 resp = requests.delete(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             else:
-                raise ValueError("Unknown HTTP method")
+                raise ValueError(f"Unknown HTTP method: {method}")
 
+            # Handle rate-limiting with backoff
             if resp.status_code == 429:
                 ra = resp.headers.get("Retry-After")
                 if ra is not None:
@@ -331,23 +334,25 @@ def _request(method: str, path: str, *, params=None, json_data=None) -> Any:
                 time.sleep(wait)
                 continue
 
-            if not resp.ok:
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = None
-                logging.error(f"{method} {url} -> {resp.status_code} {resp.text}")
-                raise MerakiAPIError(resp.status_code, resp.text, body, url)
+            # Raise for HTTP errors (built-in HTTPError from requests)
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as http_err:
+                logging.error("%s %s -> %s %s", method, url, resp.status_code, resp.text)
+                raise
 
             if resp.text:
                 try:
                     return resp.json()
-                except Exception:
+                except json.JSONDecodeError:
                     return resp.text
             return None
-        except MerakiAPIError:
+
+        except requests.exceptions.HTTPError:
+            # Don't retry on HTTP errors other than 429 (handled above)
             raise
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
+            # Network / connection / timeout errors
             if attempt == MAX_RETRIES:
                 logging.exception(f"HTTP error for {url}: {e}")
                 raise
@@ -546,19 +551,34 @@ def ensure_mr33_and_handle_wireless_replacements(
 # VLAN error detector (robust)
 # =====================
 def is_vlans_disabled_error(exc: Exception) -> bool:
+    """
+    Detects "VLANs are not enabled for this network" on built-in HTTPError
+    or any other exception type by inspecting the associated response/text.
+    """
     needle = "VLANs are not enabled for this network"
-    try:
-        if isinstance(exc, MerakiAPIError):
-            if exc.status_code == 400:
-                if exc.json_body and isinstance(exc.json_body, dict):
-                    errs = exc.json_body.get("errors")
-                    if errs and any(needle in str(e) for e in errs):
-                        return True
-                if needle in (exc.text or ""):
+
+    # Handle requests' HTTPError (built-in library exception)
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = exc.response
+        if resp is not None:
+            try:
+                if resp.status_code == 400:
+                    try:
+                        body = resp.json()
+                    except json.JSONDecodeError:
+                        body = None
+                    if isinstance(body, dict):
+                        errs = body.get("errors")
+                        if errs and any(needle in str(e) for e in errs):
+                            return True
+                if needle in (resp.text or ""):
                     return True
-        return needle in str(exc)
-    except Exception:
-        return False
+            except Exception:
+                # Fall through to generic string check below
+                pass
+
+    # Fallback: search the exception’s string representation
+    return needle in str(exc)
 
 # =====================
 # Switch port helpers (diff + apply)
@@ -747,11 +767,11 @@ def fetch_vlan_details(network_id: str) -> List[Dict[str, Any]]:
         filtered = [v for v in vlans if int(v.get('id')) not in EXCLUDED_VLANS]
         logging.debug(f"Fetched VLANs: {len(filtered)} (excluded {len(vlans) - len(filtered)})")
         return filtered
-    except MerakiAPIError as e:
+    except requests.exceptions.HTTPError as e:
         if is_vlans_disabled_error(e):
             logging.warning("VLAN endpoints unavailable because VLANs are disabled on this network (returning empty list).")
             return []
-        logging.exception("Failed to fetch VLANs")
+        logging.exception("Failed to fetch VLANs (HTTPError)")
         return []
     except Exception:
         logging.exception("Failed to fetch VLANs")
@@ -822,10 +842,12 @@ def update_vlans(network_id: str, network_name: str, vlan_list: List[Dict[str, A
                 network_name=network_name,
                 misc=json.dumps(payload),
             )
-        except MerakiAPIError as e:
+        except requests.exceptions.HTTPError as e:
             if is_vlans_disabled_error(e):
+                # Let caller / outer logic decide how to handle global VLAN-disabled state
                 raise
-            logging.exception("Failed to update VLAN %s (HTTP %s): %s", vlan_id, e.status_code, e.text)
+            logging.exception("Failed to update VLAN %s (HTTP %s): %s", vlan_id,
+                              e.response.status_code if e.response else "?", str(e))
         except Exception:
             logging.exception("Failed to update VLAN %s", vlan_id)
 
@@ -841,8 +863,9 @@ def classify_serials_for_binding(org_id: str, net_id: str, serials: List[str]):
                 elsewhere.append((s, inv.get('networkName') or nid))
             else:
                 avail.append(s)
-        except MerakiAPIError as e:
-            if e.status_code == 404:
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                # Not in inventory yet
                 avail.append(s)
             else:
                 logging.error(f"Error checking inventory for {s}: {e}")
@@ -962,8 +985,10 @@ def prompt_and_validate_serials(org_id: str) -> List[str]:
                     print(f"✅ {serial} found in org inventory.")
                     collected.append(serial)
                     break
-                except MerakiAPIError as e:
-                    if getattr(e, "status_code", None) == 404:
+                except requests.exceptions.HTTPError as e:
+                    resp = e.response
+                    status_code = resp.status_code if resp is not None else None
+                    if status_code == 404:
                         try:
                             do_action(
                                 meraki_post,
@@ -1333,17 +1358,22 @@ def enable_mx_wan2(serial: str) -> bool:
     existing: Dict[str, Any] | None = None
     try:
         existing = meraki_get(path)
-    except MerakiAPIError as e:
-        if e.status_code not in (400, 404):
-            logging.debug("GET uplink settings for %s returned %s, proceeding with minimal payload", serial, e.status_code)
+    except requests.exceptions.HTTPError as e:
+        resp = e.response
+        if resp is not None and resp.status_code not in (400, 404):
+            logging.debug(
+                "GET uplink settings for %s returned %s, proceeding with minimal payload",
+                serial, resp.status_code
+            )
+    except Exception:
+        logging.exception("Error reading uplink settings for %s; proceeding with minimal payload", serial)
 
-    payload: Dict[str, Any]
     if isinstance(existing, dict):
         merged = dict(existing)
         wan2 = dict(merged.get("wan2", {}))
         wan2["enabled"] = True
         merged["wan2"] = wan2
-        payload = merged
+        payload: Dict[str, Any] = merged
     else:
         payload = {"wan2": {"enabled": True}}
 
@@ -1357,7 +1387,7 @@ def enable_mx_wan2(serial: str) -> bool:
         )
         logging.info("Enabled WAN2 for %s", serial)
         return True
-    except MerakiAPIError as e:
+    except requests.exceptions.HTTPError as e:
         try:
             do_action(meraki_put, path, data={"wan2": {"enabled": True}})
             log_change(
@@ -1369,7 +1399,9 @@ def enable_mx_wan2(serial: str) -> bool:
             logging.info("Enabled WAN2 (fallback) for %s", serial)
             return True
         except Exception:
-            logging.error("Failed enabling WAN2 for %s: %s %s", serial, e.status_code, e.text)
+            resp = e.response
+            status = resp.status_code if resp is not None else "?"
+            logging.error("Failed enabling WAN2 for %s: %s %s", serial, status, str(e))
             return False
     except Exception:
         logging.exception("Unexpected error enabling WAN2 for %s", serial)
@@ -1389,8 +1421,10 @@ def enable_wan2_on_claimed_mx(org_id: str, claimed_serials: List[str]) -> None:
                     logging.warning("WAN2 not enabled for %s (model %s)", s, model)
             else:
                 logging.info("Skipping WAN2 enable for %s (model %s is not MX67)", s, model or "unknown")
-        except MerakiAPIError as e:
-            logging.exception("Inventory check failed for %s: %s %s", s, e.status_code, e.text)
+        except requests.exceptions.HTTPError as e:
+            resp = e.response
+            status = resp.status_code if resp is not None else "?"
+            logging.exception("Inventory check failed for %s: %s %s", s, status, str(e))
         except Exception:
             logging.exception("Could not evaluate/enable WAN2 for %s", s)
 
@@ -1742,8 +1776,8 @@ def list_and_rebind_template(
             print(f"✅ Bound to {chosen.get('name')}")
             return chosen['id'], chosen.get('name'), False
 
-        except MerakiAPIError as e:
-            logging.error(f"Error binding template: {e}")
+        except requests.exceptions.HTTPError as e:
+            logging.error("Error binding template: %s", e)
             must_rollback = bool(current_id)
             if is_vlans_disabled_error(e):
                 print("❌ VLANs are not enabled for this network. Binding failed and state may be partial.")
@@ -1833,7 +1867,7 @@ def bind_network_to_template(
 
     try:
         update_vlans(network_id, network_name, vlan_list)
-    except MerakiAPIError as e:
+    except requests.exceptions.HTTPError as e:
         if is_vlans_disabled_error(e):
             print("❌ VLANs disabled error during VLAN update. Rolling back immediately...")
             rollback_all_changes(
@@ -1849,6 +1883,7 @@ def bind_network_to_template(
             )
             log_change('workflow_end', 'Exited after rollback due to VLANs disabled during VLAN update')
             raise SystemExit(1)
+        # For other HTTP errors just re-raise
         raise
 
 def select_switch_profile_interactive_by_model(tpl_profiles: List[Dict[str, Any]], tpl_profile_map: Dict[str, str], switch_model: str) -> Optional[str]:
@@ -1893,7 +1928,7 @@ def rollback_all_changes(
     """
     print("=== Starting rollback to previous network state ===")
 
-    # Build quick lookup sets/maps from pre-change state
+     # Build quick lookup sets/maps from pre-change state
     pre_serials: Set[str] = {d.get("serial", "") for d in pre_change_devices if d.get("serial")}
     pre_by_serial: Dict[str, Dict[str, Any]] = {d["serial"]: d for d in pre_change_devices if d.get("serial")}
 
@@ -2557,7 +2592,6 @@ if __name__ == '__main__':
 
 
         # Optional: VLAN-count based template suggestion in light flow
-        # Optional: VLAN-count based template suggestion in light flow
         try:
             all_templates_raw: Any = meraki_get(f"/organizations/{org_id}/configTemplates")
             all_templates: List[Dict[str, Any]] = (
@@ -2614,9 +2648,12 @@ if __name__ == '__main__':
                         step_status['vlans_updated'] = True
                         old_template = new_template
 
-                    except MerakiAPIError as e:
+                    except requests.exceptions.HTTPError as e:
+                        resp = e.response
+                        status = resp.status_code if resp is not None else "?"
+                        text = resp.text if resp is not None else ""
                         logging.exception(
-                            "Light-flow suggested bind failed: %s %s", e.status_code, e.text
+                            "Light-flow suggested bind failed: HTTP %s: %s", status, text
                         )
                         print("❌ Failed to bind suggested template in light flow.")
                         step_status['template_bound'] = False
@@ -2635,7 +2672,6 @@ if __name__ == '__main__':
 
         except Exception:
             logging.exception("Suggestion stage in light flow failed")
-
 
         # Wireless pre-check + claim
         safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
