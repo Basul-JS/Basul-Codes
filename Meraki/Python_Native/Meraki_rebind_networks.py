@@ -13,13 +13,14 @@
 # 20251120 - update the template selection logic
 # 20251121 - update to remove session state at end of rollback
 # 20251201 - using Python's built-in exceptions instead of relying on 'try/except' blocks for error handling
+# 20251205 - allow swapping of VLAN 40 and 41, perserving DHCP reservations etc
 
 """
 Meraki Rebind Networks Utility
-Version: 2025.12.01_01
+Version: 2025.12.05_03
 """
 
-SCRIPT_VERSION = "2025.12.01_01"
+SCRIPT_VERSION = "2025.12.05_04_flatten_network"
 
 import requests
 import logging
@@ -39,6 +40,8 @@ from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.utils import get_column_letter
 from dataclasses import dataclass, asdict
 from difflib import SequenceMatcher  # still used elsewhere for network matching if needed
+from ipaddress import ip_network, ip_address
+
 
 # =====================
 # Config & Constants
@@ -73,7 +76,8 @@ def log_change(
     org_name: Optional[str] = None,
     network_id: Optional[str] = None,
     network_name: Optional[str] = None,
-) -> None:
+    
+    ) -> None:
     file_exists = os.path.isfile(CSV_LOGFILE)
     with open(CSV_LOGFILE, mode='a', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
@@ -95,6 +99,7 @@ def log_change(
             org_name or '',
             network_id or '',
             network_name or ''
+            
         ])
 
 # ---- Caches to avoid repeated org-wide scans (reduces 429s) ----
@@ -790,6 +795,52 @@ def vlans_enabled(network_id: str) -> Optional[bool]:
     except Exception:
         logging.exception("Could not read VLANs settings")
         return None
+
+def _preserve_dhcp_state_for_vlan(
+    original_vlan: Dict[str, Any],
+    new_vlan: Dict[str, Any],
+    new_fixed: Optional[Dict[str, Any]],
+    new_ranges: Optional[List[Dict[str, Any]]],
+) -> None:
+    """
+    Take the DHCP state from original_vlan and impose it on new_vlan:
+    - Preserve dhcpHandling string (server/relay/off)
+    - For 'server', use new_fixed/new_ranges + original dnsNameservers
+    - For 'relay', keep original relay IP(s)
+    - For 'off', strip DHCP-specific fields
+    """
+    orig_dhcp = original_vlan.get("dhcpHandling")
+    mode = _dhcp_mode(orig_dhcp)  # uses your existing helper
+
+    # Always preserve the original dhcpHandling string
+    if orig_dhcp is not None:
+        new_vlan["dhcpHandling"] = orig_dhcp
+
+    # Clear conflicting fields so we don't mix server+relay settings
+    for k in ("fixedIpAssignments", "reservedIpRanges", "dnsNameservers",
+              "dhcpRelayServerIps", "dhcpRelayServerIp"):
+        if k in new_vlan:
+            new_vlan.pop(k, None)
+
+    if mode == "server":
+        # Re-IP reservations into the new subnet, preserving last octet
+        if new_fixed is not None:
+            new_vlan["fixedIpAssignments"] = new_fixed
+        if new_ranges is not None:
+            new_vlan["reservedIpRanges"] = new_ranges
+        dns = original_vlan.get("dnsNameservers")
+        if dns is not None:
+            new_vlan["dnsNameservers"] = dns
+
+    elif mode == "relay":
+        relay_ips = (
+            original_vlan.get("dhcpRelayServerIps")
+            or original_vlan.get("dhcpRelayServerIp")
+        )
+        if relay_ips is not None:
+            new_vlan["dhcpRelayServerIps"] = relay_ips
+
+    # mode == "off": nothing to re-add; we already cleared DHCP fields
 
 def _dhcp_mode(val: Optional[str]) -> str:
     v = (val or "").strip().lower()
@@ -1544,6 +1595,226 @@ def _get_template_name(org_id: str, template_id: Optional[str]) -> Optional[str]
         logging.exception("Could not fetch template name for %s", template_id)
         return None
 
+# CloudStore / PreSCE template patterns
+CLOUDSTORE_BASE_RE = re.compile(r'^GBR-CT-CloudStore-(\d{3})$', re.IGNORECASE)
+PRESCE_MX75_RE = re.compile(r'^GBR-CT-CloudStore-PreSCE-(\d{3})-MX75$', re.IGNORECASE)
+
+
+def _cloudstore_store_code_from_name(name: Optional[str]) -> Optional[str]:
+    """
+    Returns the 3-digit store code (*** in GBR-CT-CloudStore-***) or None.
+    """
+    if not name:
+        return None
+    m = CLOUDSTORE_BASE_RE.match(name.strip())
+    return m.group(1) if m else None
+
+
+def _cloudstore_presce_store_code_from_name(name: Optional[str]) -> Optional[str]:
+    """
+    Returns the 3-digit store code (*** in GBR-CT-CloudStore-PreSCE-***-MX75) or None.
+    """
+    if not name:
+        return None
+    m = PRESCE_MX75_RE.match(name.strip())
+    return m.group(1) if m else None
+
+def _readdress_ip_preserve_last_octet(old_ip: str, new_subnet: str) -> Optional[str]:
+    """
+    Take an existing IPv4 address (old_ip) and a new subnet string (e.g. '10.41.41.0/24'),
+    and return a new IP in the *new* subnet but with the *same last octet* as old_ip.
+    If parsing fails, returns None so the caller can decide what to do.
+    """
+    try:
+        net = ip_network(str(new_subnet), strict=False)
+        if net.version != 4:
+            return None
+        new_net_octets = str(net.network_address).split(".")
+        if len(new_net_octets) != 4:
+            return None
+
+        old_octets = str(old_ip).split(".")
+        if len(old_octets) != 4:
+            return None
+
+        last_octet = old_octets[-1]
+        return ".".join(new_net_octets[:3] + [last_octet])
+    except Exception:
+        logging.exception("Failed to readdress IP %s into subnet %s", old_ip, new_subnet)
+        return None
+
+
+def _readdress_fixed_assignments_preserve_last_octet(
+    fixed: Optional[Dict[str, Any]],
+    new_subnet: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Given a fixedIpAssignments dict and a new subnet, re-IP each reservation
+    into the new subnet, preserving the last octet of the IP.
+    Falls back to the original dict if anything critical fails.
+    """
+    if not fixed or not isinstance(fixed, dict) or not new_subnet:
+        return fixed
+
+    out: Dict[str, Any] = {}
+    for key, val in fixed.items():
+        if not isinstance(val, dict):
+            out[key] = val
+            continue
+        old_ip = val.get("ip")
+        if not old_ip:
+            out[key] = val
+            continue
+        new_ip = _readdress_ip_preserve_last_octet(str(old_ip), str(new_subnet))
+        if not new_ip:
+            out[key] = val
+            continue
+        new_val = dict(val)
+        new_val["ip"] = new_ip
+        out[key] = new_val
+    return out
+
+
+def _readdress_reserved_ranges_preserve_last_octet(
+    ranges: Optional[List[Dict[str, Any]]],
+    new_subnet: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Optional: re-IP reservedIpRanges so that start/end move into the new subnet,
+    preserving the last octet of each end-point.
+    """
+    if not ranges or not isinstance(ranges, list) or not new_subnet:
+        return ranges
+
+    out: List[Dict[str, Any]] = []
+    for r in ranges:
+        if not isinstance(r, dict):
+            out.append(r)
+            continue
+        start = r.get("start")
+        end = r.get("end")
+        if not start and not end:
+            out.append(r)
+            continue
+
+        new_r = dict(r)
+        if start:
+            new_start = _readdress_ip_preserve_last_octet(str(start), str(new_subnet))
+            if new_start:
+                new_r["start"] = new_start
+        if end:
+            new_end = _readdress_ip_preserve_last_octet(str(end), str(new_subnet))
+            if new_end:
+                new_r["end"] = new_end
+        out.append(new_r)
+    return out
+
+def maybe_swap_vlan_40_41(vlans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Return a new VLAN list where VLAN 40 and VLAN 41 have their *config*
+    swapped, and any DHCP reservations are re-addressed into the new subnet
+    (preserving the last octet), while ensuring that:
+
+      - If VLAN 40 had DHCP enabled (server/relay), it still does after swap.
+      - If VLAN 41 had DHCP enabled, it still does after swap.
+
+    DHCP "enabledness" is tied to the VLAN ID (40 vs 41), not to the subnet.
+    """
+    if not isinstance(vlans, list):
+        return vlans
+
+    vlan_40 = None
+    vlan_41 = None
+    others: List[Dict[str, Any]] = []
+
+    for v in vlans:
+        try:
+            vid_raw = v.get("id") or v.get("vlan") or v.get("vlanId")
+            vid = int(str(vid_raw))
+        except Exception:
+            others.append(v)
+            continue
+
+        if vid == 40:
+            vlan_40 = v
+        elif vid == 41:
+            vlan_41 = v
+        else:
+            others.append(v)
+
+    if not (vlan_40 and vlan_41):
+        # Nothing to do if one VLAN is missing
+        return vlans
+
+    # Base configs swapped (subnet, applianceIp, etc.)
+    base_40 = dict(vlan_41)  # VLAN ID 40 will now look like old 41's config
+    base_41 = dict(vlan_40)  # VLAN ID 41 will now look like old 40's config
+
+    # Ensure IDs stay correct
+    base_40["id"] = 40
+    base_41["id"] = 41
+
+    # Old reservations attached to each VLAN ID
+    old_40_fixed = vlan_40.get("fixedIpAssignments")
+    old_41_fixed = vlan_41.get("fixedIpAssignments")
+    old_40_ranges = vlan_40.get("reservedIpRanges")
+    old_41_ranges = vlan_41.get("reservedIpRanges")
+
+    # Target subnets after the swap (the ones each VLAN will now use)
+    target_subnet_for_40 = base_40.get("subnet")
+    target_subnet_for_41 = base_41.get("subnet")
+
+    # Re-IP reservations into the *new* subnet, preserving last octet
+    new_fixed_for_40 = _readdress_fixed_assignments_preserve_last_octet(
+        old_40_fixed, target_subnet_for_40
+    )
+    new_fixed_for_41 = _readdress_fixed_assignments_preserve_last_octet(
+        old_41_fixed, target_subnet_for_41
+    )
+
+    new_ranges_for_40 = _readdress_reserved_ranges_preserve_last_octet(
+        old_40_ranges, target_subnet_for_40
+    )
+    new_ranges_for_41 = _readdress_reserved_ranges_preserve_last_octet(
+        old_41_ranges, target_subnet_for_41
+    )
+
+    # IMPORTANT: Preserve DHCP "enabledness" per VLAN ID.
+    # VLAN 40 keeps its original DHCP mode, but on the new subnet & reservations.
+    _preserve_dhcp_state_for_vlan(
+        original_vlan=vlan_40,
+        new_vlan=base_40,
+        new_fixed=new_fixed_for_40,
+        new_ranges=new_ranges_for_40,
+    )
+
+    # Same for VLAN 41.
+    _preserve_dhcp_state_for_vlan(
+        original_vlan=vlan_41,
+        new_vlan=base_41,
+        new_fixed=new_fixed_for_41,
+        new_ranges=new_ranges_for_41,
+    )
+
+    logging.info(
+        "Swapped VLAN 40/41 configs, re-IP'd DHCP reservations (preserving last octet), "
+        "and preserved DHCP enabled state per VLAN."
+    )
+    print(
+        "🔁 Swapping VLAN 40/41, re-addressing DHCP reservations (preserving last octet), "
+        "and preserving DHCP enabled state."
+    )
+
+    new_list = others + [base_40, base_41]
+    # Keep output in a stable order by VLAN ID if possible
+    try:
+        new_list.sort(key=lambda v: int(str(v.get("id") or 0)))
+    except Exception:
+        pass
+
+    return new_list
+
+
 def list_and_rebind_template(
     org_id: str,
     network_id: str,
@@ -1557,16 +1828,26 @@ def list_and_rebind_template(
     removed_serials: Optional[List[str]] = None,
     ms_list: Optional[List[Dict[str, Any]]] = None,
     mx_model_filter: Optional[str] = None,
-) -> Tuple[Optional[str], Optional[str], bool]:
+) -> Tuple[Optional[str], Optional[str], bool, bool]:
     """
     Interactive template selector that:
       - shows the number of networks bound to each template
       - only lists templates with < 90 networks bound
       - preserves existing VLAN-based suggestion behavior
       - for 4 VLANs, excludes 'NO LEGACY ... MX' and '3 X DATA VLAN ... MX75' templates
-    Returns: (new_template_id, new_template_name, rollback_triggered)
+
+    NEW:
+      - If current bound template is 'GBR-CT-CloudStore-***':
+          - Ask if operator wants to FLATTEN / standardise the network.
+          - If yes, only show templates 'GBR-CT-CloudStore-PreSCE-***-MX75'
+            for the same store code (***).
+      - Returns an extra bool flag:
+          cloudstore_presce_flow = True if we selected a PreSCE MX75 template
+          as part of this flatten/standardise path.
+    Returns: (new_template_id, new_template_name, rollback_triggered, cloudstore_presce_flow)
     """
     skip_attempts = 0
+    cloudstore_presce_flow = False
 
     # Fetch all templates
     all_templates_raw: Any = meraki_get(f"/organizations/{org_id}/configTemplates")
@@ -1598,7 +1879,7 @@ def list_and_rebind_template(
     # If we have no eligible ones, fall back to unknown list (so the menu isn't empty)
     if not eligible and not unknown:
         print("ℹ️ No templates available (could not fetch template list).")
-        return current_id, None, False
+        return current_id, None, False, False
 
     if not eligible and unknown:
         print("⚠️ Could not compute bound counts (or none are under 90). "
@@ -1624,6 +1905,23 @@ def list_and_rebind_template(
     # Resolve current template name once (may be None)
     current_tpl_name: Optional[str] = _get_template_name(org_id, current_id) if current_id else None
 
+    # --- NEW: CloudStore flatten / standardise prompt ---
+    flatten_requested = False
+    presce_target_store_code: Optional[str] = None
+    if current_tpl_name:
+        store_code = _cloudstore_store_code_from_name(current_tpl_name)
+        if store_code:
+            # Only ask once
+            q = (
+                f"\nCurrent template '{current_tpl_name}' is a CloudStore template "
+                f"for store {store_code}.\n"
+                "Would you like to FLATTEN VLAN's / standardise this network using the "
+                "GBR-CT-CloudStore-PreSCE-***-MX75 template? "
+            )
+            flatten_requested = _prompt_yes_no(q, default_no=True)
+            if flatten_requested:
+                presce_target_store_code = store_code
+
     # If VLAN count is exactly 4, exclude names matching the 3/5-VLAN patterns
     if vlan_count == 4:
         rx_no_legacy_mx = re.compile(r'NO\s*LEGACY.*MX(?:\d{2})?\b', re.IGNORECASE)
@@ -1636,13 +1934,11 @@ def list_and_rebind_template(
         if not filtered:
             print("⚠️ No templates left after excluding 3/5-VLAN patterns for a 4-VLAN network.")
             # Nothing to pick from; bail out without changing template.
-            return current_id, None, False
+            return current_id, None, False, False
 
-    # For 3- or 5-VLAN networks, only show templates in the same "family"
-    # as the currently bound template:
-    #   - If bound template name contains 'PreSCE' -> only show PreSCE templates
-    #   - Otherwise -> exclude any templates that contain 'PreSCE'
-    if vlan_count in (3, 5) and current_tpl_name:
+        # For 3- or 5-VLAN networks, only show templates in the same "family"
+    # as the currently bound template, UNLESS we are explicitly flattening.
+    if vlan_count in (3, 5) and current_tpl_name and not flatten_requested:
         up_curr = current_tpl_name.upper()
 
         if "PRESCE" in up_curr:
@@ -1659,9 +1955,28 @@ def list_and_rebind_template(
                 and "PRESCE" not in (t.get('name') or "").upper()
             ]
 
-        # Only apply narrowing if it actually leaves us something
         if narrowed:
             filtered = narrowed
+
+
+        # --- If flatten requested, restrict to ALL PreSCE MX75 CloudStore templates (< 90 bound) ---
+    if flatten_requested:
+        presce_filtered: List[Dict[str, Any]] = []
+        for t in filtered:
+            tname = (t.get("name") or "").strip()
+            if PRESCE_MX75_RE.match(tname):
+                presce_filtered.append(t)
+
+        if presce_filtered:
+            filtered = presce_filtered
+        else:
+            print(
+                "⚠️ No GBR-CT-CloudStore-PreSCE-***-MX75 templates found under current filters. "
+                "Continuing with normal list."
+            )
+            # fall back to normal behaviour if none exist
+            flatten_requested = False
+
 
     # Now compute the suggestion against the final filtered list
     try:
@@ -1742,7 +2057,7 @@ def list_and_rebind_template(
                 ms_list=ms_list or [],
                 network_name=network_name,
             )
-            return current_id, None, True
+            return current_id, None, True, False
 
         if sel == "a" and suggested_tpl:
             chosen = suggested_tpl
@@ -1758,7 +2073,15 @@ def list_and_rebind_template(
 
         if chosen['id'] == current_id:
             print("No change (already bound to that template).")
-            return current_id, chosen['name'], False
+            return current_id, chosen['name'], False, False
+
+        # Detect if this choice is the CloudStore PreSCE MX75 template for flatten
+        try:
+            chosen_name = (chosen.get("name") or "").strip()
+            if flatten_requested and PRESCE_MX75_RE.match(chosen_name):
+                cloudstore_presce_flow = True
+        except Exception:
+            logging.exception("Failed evaluating CloudStore PreSCE flow flag")
 
         try:
             if current_id:
@@ -1780,7 +2103,7 @@ def list_and_rebind_template(
                 network_name=network_name,
             )
             print(f"✅ Bound to {chosen.get('name')}")
-            return chosen['id'], chosen.get('name'), False
+            return chosen['id'], chosen.get('name'), False, cloudstore_presce_flow
 
         except requests.exceptions.HTTPError as e:
             logging.error("Error binding template: %s", e)
@@ -1802,7 +2125,7 @@ def list_and_rebind_template(
                     ms_list=ms_list or [],
                     network_name=network_name,
                 )
-                return current_id, None, True
+                return current_id, None, True, False
 
             print(f"❌ Failed to bind template: {e}. You can try again or cancel.")
             continue
@@ -1822,19 +2145,19 @@ def list_and_rebind_template(
                     ms_list=ms_list or [],
                     network_name=network_name,
                 )
-                return current_id, None, True
+                return current_id, None, True, False
             print(f"❌ Unexpected error: {e}. You can try again or cancel.")
             continue
 
     # Safety net for type checkers; execution should never reach here.
-    return current_id, None, False
+    return current_id, None, False, False
+
 
 def _current_vlan_count(network_id: str) -> Optional[int]:
     vlans = fetch_vlan_details(network_id)
     return len(vlans) if isinstance(vlans, list) else None
 
 # ---------- Template rebind helpers (with rollback) ----------
-
 
 def bind_network_to_template(
     org_id: str,
@@ -1871,8 +2194,18 @@ def bind_network_to_template(
         log_change('workflow_end', 'Exited after rollback due to VLANs disabled (pre-check)')
         raise SystemExit(1)
 
+    # --- NEW: Detect CloudStore PreSCE MX75 template and swap VLAN 40/41 ---
+    vlans_to_push = vlan_list
     try:
-        update_vlans(network_id, network_name, vlan_list)
+        tpl_name = _get_template_name(org_id, tpl_id)
+        if tpl_name and PRESCE_MX75_RE.match(tpl_name.strip()):
+            # Only swap when binding to GBR-CT-CloudStore-PreSCE-***-MX75
+            vlans_to_push = maybe_swap_vlan_40_41(vlan_list)
+    except Exception:
+        logging.exception("Failed to evaluate template name for VLAN 40/41 swap; using original VLAN list.")
+
+    try:
+        update_vlans(network_id, network_name, vlans_to_push)
     except requests.exceptions.HTTPError as e:
         if is_vlans_disabled_error(e):
             print("❌ VLANs disabled error during VLAN update. Rolling back immediately...")
@@ -1892,15 +2225,87 @@ def bind_network_to_template(
         # For other HTTP errors just re-raise
         raise
 
-def select_switch_profile_interactive_by_model(tpl_profiles: List[Dict[str, Any]], tpl_profile_map: Dict[str, str], switch_model: str) -> Optional[str]:
-    candidates = [p for p in tpl_profiles if switch_model in p.get('model', [])]
+def _parse_switch_model_series_ports(model_str: str) -> Tuple[str, Optional[int]]:
+    """
+    Parse a Meraki switch model into (series, port_count), e.g.:
+      'MS225-24P'  -> ('MS225', 24)
+      'MS225-48LP' -> ('MS225', 48)
+    If parsing fails, ports is None.
+    """
+    if not model_str:
+        return "", None
+    m = re.match(r"^(MS\d+)-(\d+)", model_str.upper())
+    if not m:
+        return model_str.upper(), None
+    series = m.group(1)
+    try:
+        ports = int(m.group(2))
+    except ValueError:
+        ports = None
+    return series, ports
+
+
+def _profile_supports_switch_model(profile: Dict[str, Any], switch_model: str) -> bool:
+    """
+    True if this switch profile is suitable for the given switch model.
+    - Same series (e.g. MS225)
+    - Same port count when both are known (24 vs 48)
+    """
+    if not switch_model:
+        return False
+
+    sw_series, sw_ports = _parse_switch_model_series_ports(switch_model)
+    if not sw_series:
+        return False
+
+    prof_models = profile.get("model")
+    if not prof_models:
+        return False
+
+    # Meraki SDK may give a string or a list of models
+    if isinstance(prof_models, str):
+        prof_models_list = [prof_models]
+    else:
+        prof_models_list = list(prof_models)
+
+    for pm in prof_models_list:
+        p_series, p_ports = _parse_switch_model_series_ports(str(pm))
+        if not p_series:
+            continue
+        if p_series != sw_series:
+            continue
+        # If we know both port counts and they differ, skip
+        if sw_ports is not None and p_ports is not None and sw_ports != p_ports:
+            continue
+        # Otherwise treat as compatible
+        return True
+
+    return False
+
+def select_switch_profile_interactive_by_model(
+    tpl_profiles: List[Dict[str, Any]],
+    tpl_profile_map: Dict[str, str],
+    switch_model: str
+) -> Optional[str]:
+    """
+    Show only profiles that are compatible with the given switch model
+    (same series, same 24/48 count where known).
+    """
+    candidates = [p for p in tpl_profiles if _profile_supports_switch_model(p, switch_model)]
     if not candidates:
         print(f"No switch profiles in template support {switch_model}.")
         return None
+
     print(f"\nAvailable switch profiles for {switch_model}:")
     for idx, p in enumerate(candidates, 1):
-        print(f"{idx}. {p['name']}")
-    profile_names = [p['name'] for p in candidates]
+        name = str(p.get("name") or "<unnamed>")
+        print(f"{idx}. {name}")
+
+    # Force this to be List[str] so type-checkers are happy
+    profile_names: List[str] = []
+    for p in candidates:
+        profile_names.append(str(p.get("name") or ""))
+
     while True:
         choice = input("Select switch profile by number (or Enter to skip): ").strip()
         if not choice:
@@ -1908,8 +2313,57 @@ def select_switch_profile_interactive_by_model(tpl_profiles: List[Dict[str, Any]
         if choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(profile_names):
-                return tpl_profile_map[profile_names[idx]]
+                selected_name: str = profile_names[idx]
+                profile_id = tpl_profile_map.get(selected_name)
+                if profile_id:
+                    return profile_id
+                print("Selected profile has no ID mapping; please choose another.")
+                continue
         print("Invalid selection. Please try again.")
+
+def select_switch_profile_for_network(
+    tpl_profiles: List[Dict[str, Any]],
+    example_switch_model: Optional[str] = None
+) -> Optional[str]:
+    """
+    Show switch profiles on the new template for a representative switch model.
+    If example_switch_model is provided, only show compatible profiles
+    (same series, same 24/48 count).
+    """
+    if not tpl_profiles:
+        print("No switch profiles found on the new template.")
+        return None
+
+    if example_switch_model:
+        candidates = [
+            p for p in tpl_profiles
+            if _profile_supports_switch_model(p, example_switch_model)
+        ]
+        if not candidates:
+            print(f"No switch profiles compatible with {example_switch_model} found.")
+            return None
+    else:
+        candidates = tpl_profiles
+
+    print("\nSwitch profiles available on the new template:")
+    for idx, p in enumerate(candidates, 1):
+        print(f"{idx}. {p.get('name', '<unnamed>')}  (ID: {p.get('switchProfileId')})")
+
+    while True:
+        raw = input("Select switch profile # to use for this network (or press Enter to skip): ").strip()
+        if not raw:
+            print("Skipping network-level switch profile selection.")
+            return None
+        if not raw.isdigit():
+            print("Please enter a valid number from the list.")
+            continue
+        idx = int(raw)
+        if not (1 <= idx <= len(candidates)):
+            print("Number out of range.")
+            continue
+        chosen = candidates[idx - 1]
+        return chosen.get("switchProfileId")
+
 
 # =====================
 # Rollback
@@ -2493,7 +2947,7 @@ if __name__ == '__main__':
     print(f"\n🔧 Meraki Rebind Tool — Version {SCRIPT_VERSION}\n")
     log_change('workflow_start', 'Script started')
     logging.info(f"Starting Meraki Rebind Tool (version {SCRIPT_VERSION})")
-
+        
     step_status: Dict[str, StatusVal] = {}
 
     # -------- Select Org --------
@@ -2825,9 +3279,10 @@ if __name__ == '__main__':
 
        # Choose & (re)bind template (with rollback on failure)
     # --- Template selection / rebind (checkpointed & idempotent) ---
+    
     if not _current_checkpoint.done('template_bound'):
         try:
-            new_template, new_tpl_name, rollback_needed = list_and_rebind_template(
+            new_template, new_tpl_name, rollback_needed, cloudstore_presce = list_and_rebind_template(
                 org_id=org_id,
                 network_id=network_id,
                 current_id=old_template,
@@ -2845,6 +3300,11 @@ if __name__ == '__main__':
             _current_checkpoint.bound_template_id = new_template or old_template
             _current_checkpoint.mark('template_bound', step_status['template_bound'])
 
+            # Persist the CloudStore→PreSCE flow flag for later steps
+            _current_checkpoint.step_status = _current_checkpoint.step_status or {}
+            _current_checkpoint.step_status['cloudstore_presce_flow'] = cloudstore_presce
+            _current_checkpoint.save()
+
             # Stop here if rollback triggered (list_and_rebind_template already did the rollback)
             if rollback_needed:
                 raise SystemExit(0)
@@ -2854,10 +3314,11 @@ if __name__ == '__main__':
             step_status['template_bound'] = False
             _current_checkpoint.mark('template_bound', step_status['template_bound'])
             new_template = _current_checkpoint.bound_template_id or old_template
+            cloudstore_presce = bool((_current_checkpoint.step_status or {}).get('cloudstore_presce_flow'))
     else:
         print("⏭️  Skipping template selection/bind (already completed).")
         new_template = _current_checkpoint.bound_template_id or old_template
-
+        cloudstore_presce = bool((_current_checkpoint.step_status or {}).get('cloudstore_presce_flow'))
         # VLAN update after rebind
     if not _current_checkpoint.done('vlans_updated'):
         try:
@@ -2883,11 +3344,11 @@ if __name__ == '__main__':
     else:
         print("⏭️  Skipping VLAN update (already completed).")
 
-
-
-    # Fetch new template profiles for post-bind MS mapping
+        # Fetch new template profiles for post-bind MS mapping
     try:
-        tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{new_template}/switch/profiles") if new_template else []
+        tpl_profiles = meraki_get(
+            f"/organizations/{org_id}/configTemplates/{new_template}/switch/profiles"
+        ) if new_template else []
         tpl_profile_map = {p['name']: p['switchProfileId'] for p in (tpl_profiles or [])}
     except Exception:
         logging.exception("Failed fetch template switch profiles")
@@ -2897,22 +3358,52 @@ if __name__ == '__main__':
     # Re-assign switch profiles to match previous names / user choice
     _, postbind_ms_devices, _ = fetch_devices(org_id, network_id, template_id=new_template)
 
+    # --- CloudStore→PreSCE flow: ask ONCE which profile to use, using
+    #     the first MS as the representative model (24 vs 48).
+    network_level_profile_id: Optional[str] = None
+    if cloudstore_presce and tpl_profiles and postbind_ms_devices:
+        example_model = postbind_ms_devices[0].get("model")
+        network_level_profile_id = select_switch_profile_for_network(
+            tpl_profiles,
+            example_switch_model=example_model,
+        )
+
     for sw in postbind_ms_devices:
         serial = sw['serial']
         old_profile_id = ms_serial_to_profileid.get(serial)
         old_profile_name = old_profileid_to_name.get(old_profile_id) if isinstance(old_profile_id, str) else None
 
-        new_profile_id = tpl_profile_map.get(old_profile_name) if old_profile_name else None
-        if not new_profile_id and tpl_profiles:
-            new_profile_id = select_switch_profile_interactive_by_model(tpl_profiles, tpl_profile_map, sw['model'])
-            if not new_profile_id:
-                continue
+        # Decide which profile to apply
+        if network_level_profile_id:
+            # CloudStore PreSCE standardisation: apply the chosen profile to all
+            # MS devices that are compatible with it.
+            chosen_profile_id = network_level_profile_id
+            # Double-check compatibility; if it doesn't match this model, fall back.
+            if not any(
+                _profile_supports_switch_model(p, sw['model'])
+                for p in tpl_profiles
+                if p.get("switchProfileId") == chosen_profile_id
+            ):
+                chosen_profile_id = None
+        else:
+            chosen_profile_id = None
+
+        if not chosen_profile_id:
+            # Existing behaviour: try to match by original profile name,
+            # otherwise prompt per-model (filtered by 24/48).
+            chosen_profile_id = tpl_profile_map.get(old_profile_name) if old_profile_name else None
+            if not chosen_profile_id and tpl_profiles:
+                chosen_profile_id = select_switch_profile_interactive_by_model(
+                    tpl_profiles, tpl_profile_map, sw['model']
+                )
+                if not chosen_profile_id:
+                    continue
 
         try:
-            do_action(meraki_put, f"/devices/{serial}", data={"switchProfileId": new_profile_id})
+            do_action(meraki_put, f"/devices/{serial}", data={"switchProfileId": chosen_profile_id})
             log_change(
                 'switch_profile_assign',
-                f"Assigned switchProfileId {new_profile_id} to {serial}",
+                f"Assigned switchProfileId {chosen_profile_id} to {serial}",
                 device_serial=serial,
                 device_name=sw.get('name', ''),
                 misc=f"profile_name={old_profile_name or ''}"
@@ -2927,6 +3418,9 @@ if __name__ == '__main__':
 
         except Exception:
             logging.exception("Failed to assign profile/apply overrides to %s", serial)
+
+
+    
 
     # Wireless pre-check + claim
     safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
