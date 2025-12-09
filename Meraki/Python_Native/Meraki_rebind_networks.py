@@ -14,13 +14,14 @@
 # 20251121 - update to remove session state at end of rollback
 # 20251201 - using Python's built-in exceptions instead of relying on 'try/except' blocks for error handling
 # 20251205 - allow swapping of VLAN 40 and 41, perserving DHCP reservations etc
+# 20251209 - updated logic for template handling
 
 """
 Meraki Rebind Networks Utility
-Version: 2025.12.05_03
+Version: 2025.12.09_01
 """
 
-SCRIPT_VERSION = "2025.12.05_04_flatten_network"
+SCRIPT_VERSION = "2025.12.09_01_flatten_network"
 
 import requests
 import logging
@@ -2158,7 +2159,6 @@ def _current_vlan_count(network_id: str) -> Optional[int]:
     return len(vlans) if isinstance(vlans, list) else None
 
 # ---------- Template rebind helpers (with rollback) ----------
-
 def bind_network_to_template(
     org_id: str,
     network_id: str,
@@ -2175,8 +2175,43 @@ def bind_network_to_template(
 ):
     if not tpl_id:
         return
+
     time.sleep(5)
 
+    # -------- Decide whether to swap VLAN 40/41 or not --------
+    # We only swap when flattening from classic CloudStore to PreSCE-MX75.
+    # If the *old* template name already contains 'PreSCE', we are just
+    # upgrading (e.g. PreSCE -> PreSCE-MX75) and MUST NOT swap 40/41.
+    try:
+        new_tpl_name = _get_template_name(org_id, tpl_id)
+    except Exception:
+        logging.exception("Could not resolve new template name in bind_network_to_template")
+        new_tpl_name = None
+
+    try:
+        old_tpl_name = _get_template_name(org_id, pre_change_template) if pre_change_template else None
+    except Exception:
+        logging.exception("Could not resolve old template name in bind_network_to_template")
+        old_tpl_name = None
+
+    swap_40_41 = False
+
+    if new_tpl_name and PRESCE_MX75_RE.match(new_tpl_name.strip()):
+        # New template is a GBR-CT-CloudStore-PreSCE-***-MX75
+        # Only swap if the old template was *not* already a PreSCE variant.
+        # i.e. classic CloudStore -> PreSCE-MX75 = flatten case
+        if not (old_tpl_name and "PRESCE" in old_tpl_name.upper()):
+            swap_40_41 = True
+
+    if swap_40_41:
+        # Flattening case: do the 40/41 swap + DHCP re-IP (your enhanced helper).
+        vlans_to_push = maybe_swap_vlan_40_41(vlan_list)
+    else:
+        # No flattening (e.g. PreSCE -> PreSCE-MX75): push VLANs as-is.
+        # DHCP config stays tied to the same VLAN IDs; nothing is swapped.
+        vlans_to_push = vlan_list
+
+    # -------- Safety: VLANs must still be enabled post-bind --------
     enabled = vlans_enabled(network_id)
     if enabled is False:
         print("❌ VLANs are disabled on this network after binding. Rolling back immediately...")
@@ -2193,16 +2228,6 @@ def bind_network_to_template(
         )
         log_change('workflow_end', 'Exited after rollback due to VLANs disabled (pre-check)')
         raise SystemExit(1)
-
-    # --- NEW: Detect CloudStore PreSCE MX75 template and swap VLAN 40/41 ---
-    vlans_to_push = vlan_list
-    try:
-        tpl_name = _get_template_name(org_id, tpl_id)
-        if tpl_name and PRESCE_MX75_RE.match(tpl_name.strip()):
-            # Only swap when binding to GBR-CT-CloudStore-PreSCE-***-MX75
-            vlans_to_push = maybe_swap_vlan_40_41(vlan_list)
-    except Exception:
-        logging.exception("Failed to evaluate template name for VLAN 40/41 swap; using original VLAN list.")
 
     try:
         update_vlans(network_id, network_name, vlans_to_push)
@@ -2224,6 +2249,7 @@ def bind_network_to_template(
             raise SystemExit(1)
         # For other HTTP errors just re-raise
         raise
+
 
 def _parse_switch_model_series_ports(model_str: str) -> Tuple[str, Optional[int]]:
     """
